@@ -1,0 +1,24 @@
+cc_binary {
+    name: "tesla-android-virtual-display",
+
+    srcs: ["tesla-android-virtual-display.cpp"],
+
+    shared_libs: [
+        "libcutils",
+        "libutils",
+        "libbinder",
+        "libjnigraphics",
+        "libui",
+        "libgui",
+        "libjpeg",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wunused",
+        "-Wunreachable-code",
+        "-fexceptions",
+        "-std=c++17",
+    ],
+}
