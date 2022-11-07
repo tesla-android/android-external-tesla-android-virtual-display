@@ -49,12 +49,34 @@ static int32_t flinger2bitmapFormat(PixelFormat f) {
   }
 }
 
+void setResolution() {
+  char const *binaryPath = "/system/bin/wm";
+  char const *arg1 = "size";
+  char const *arg2 = "1034x788";
+
+  pid_t pid;
+  pid = fork();
+  if (pid == -1) {
+      perror("fork failed");
+      exit(-1);
+  } else if (pid == 0) {
+    execlp(binaryPath, binaryPath, arg1, arg2 ,NULL);
+    perror("execlp failed");
+    exit(-1);
+  }
+  int status;
+  wait(&status);
+  printf("child exit status: %d\n", WEXITSTATUS(status));
+}
+
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   std::optional < PhysicalDisplayId > displayId = SurfaceComposerClient::getInternalDisplayId();
   if (!displayId) {
     fprintf(stderr, "Failed to get token for internal display\n");
     return 1;
   }
+
+  setResolution();
 
   ProcessState::self() -> setThreadPoolMaxThreadCount(4);
   ProcessState::self() -> startThreadPool();
@@ -101,7 +123,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
     std::string buff = "";
 
     int compressionResult = AndroidBitmap_compress( & info, static_cast < int32_t > (dataspace), base,
-      ANDROID_BITMAP_COMPRESS_FORMAT_JPEG, 75, & buff,
+      ANDROID_BITMAP_COMPRESS_FORMAT_JPEG, 80, & buff,
       [](void * fdPtr,
         const void * data, size_t size) -> bool {
         std::string * castedBuffer = (std::string * ) fdPtr;
