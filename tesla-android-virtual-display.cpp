@@ -88,7 +88,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
     void * base = NULL;
 
     sp < SyncScreenCaptureListener > captureListener = new SyncScreenCaptureListener();
-    status_t result = ScreenshotClient::captureDisplay(displayId -> value, captureListener);
+    status_t result = ScreenshotClient::captureDisplay(*displayId, captureListener);
     if (result != NO_ERROR) {
       continue;
     }
