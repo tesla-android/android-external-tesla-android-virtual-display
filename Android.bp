@@ -11,6 +11,7 @@ cc_binary {
         "libui",
         "libgui",
         "libjpeg",
+        "libws",
     ],
 
     cflags: [
@@ -21,4 +22,9 @@ cc_binary {
         "-fexceptions",
         "-std=c++17",
     ],
+
+    include_dirs: [
+        "external/libws",
+     ],
+
 }

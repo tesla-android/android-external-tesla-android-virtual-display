@@ -34,11 +34,9 @@
 
 #include <system/graphics.h>
 
-#include <mjpeg_streamer.hpp>
+#include <ws.h>
 
 using namespace android;
-
-using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 static int32_t flinger2bitmapFormat(PixelFormat f) {
   switch (f) {
@@ -69,6 +67,26 @@ void setResolution() {
   printf("child exit status: %d\n", WEXITSTATUS(status));
 }
 
+void webSocketOnConnectionOpened(ws_cli_conn_t *client) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Connection opened, addr: %s\n", cli);
+}
+
+void webSocketOnConnectionClosed(ws_cli_conn_t *client) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Connection closed, addr: %s\n", cli);
+}
+
+void webSocketOnMessage(ws_cli_conn_t *client,
+       const unsigned char *msg, uint64_t size, int type) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Message: %s (size: %" PRId64 ", type: %d), from: %s\n", msg, size, type, cli);
+}
+
+
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   std::optional < PhysicalDisplayId > displayId = SurfaceComposerClient::getInternalDisplayId();
   if (!displayId) {
@@ -81,8 +99,11 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   ProcessState::self() -> setThreadPoolMaxThreadCount(4);
   ProcessState::self() -> startThreadPool();
 
-  MJPEGStreamer streamer;
-  streamer.start(9090, 4);
+  struct ws_events evs;
+  evs.onopen    = &webSocketOnConnectionOpened;
+  evs.onclose   = &webSocketOnConnectionClosed;
+  evs.onmessage = &webSocketOnMessage;
+  ws_socket(&evs, 9090, 1, 1000);
 
   while (true) {
     void * base = NULL;
@@ -132,12 +153,11 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
       });
 
     if (compressionResult != ANDROID_BITMAP_RESULT_SUCCESS) {
-      fprintf(stderr, "Failed to compress PNG (error code: %d)\n", compressionResult);
+      fprintf(stderr, "Failed to compress JPEG (error code: %d)\n", compressionResult);
       continue;
     }
 
-    streamer.publish("/stream", buff);
-
+    ws_sendframe_bin(NULL, buff.c_str(), buff.length());
   }
 
   return 0;
