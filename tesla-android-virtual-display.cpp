@@ -158,6 +158,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
     }
 
     ws_sendframe_bin(NULL, buff.c_str(), buff.length());
+    ws_ping(NULL, 30);
   }
 
   return 0;
