@@ -1,7 +1,13 @@
 cc_binary {
     name: "tesla-android-virtual-display",
 
-    srcs: ["tesla-android-virtual-display.cpp"],
+    srcs: [
+	"tesla-android-virtual-display.cpp",
+	"thread_safe_queue.cpp",
+	"m2m.c",
+	"frame.c",
+	"logging.c",
+    ],
 
     shared_libs: [
         "libcutils",
@@ -13,12 +19,21 @@ cc_binary {
         "libjpeg",
     ],
 
-    cflags: [
+    cppflags: [
         "-Wall",
         "-Werror",
-        "-Wunused",
-        "-Wunreachable-code",
         "-fexceptions",
         "-std=c++17",
+        "-Wno-unused-parameter",
+        "-Wno-uninitialized",
+        "-Wno-unused-variable",
+        "-O3",
+    ],
+
+    cflags: [
+	"-Wall", 
+	"-Werror",
+	"-O3", 
+	"-g3",
     ],
 }
