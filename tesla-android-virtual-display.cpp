@@ -54,36 +54,6 @@ using namespace android;
 
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
-void rgb32_to_rgb24(uint8_t * rgb32, uint8_t * rgb24, size_t width, size_t height) {
-  size_t num_pixels = width * height;
-  size_t num_iterations = num_pixels / 16;
-
-  uint8x16x4_t input;
-  uint8x16x3_t output;
-
-  for (size_t i = 0; i < num_iterations; ++i) {
-    input = vld4q_u8(rgb32);
-
-    output.val[0] = input.val[0];
-    output.val[1] = input.val[1];
-    output.val[2] = input.val[2];
-    vst3q_u8(rgb24, output);
-
-    rgb32 += 64;
-    rgb24 += 48;
-  }
-
-  size_t remaining_pixels = num_pixels % 16;
-  for (size_t i = 0; i < remaining_pixels; ++i) {
-    rgb24[0] = rgb32[0];
-    rgb24[1] = rgb32[1];
-    rgb24[2] = rgb32[2];
-
-    rgb32 += 4;
-    rgb24 += 3;
-  }
-}
-
 void setResolution() {
   char
   const * binaryPath = "/system/bin/wm";
@@ -142,7 +112,7 @@ void capture_frame(PhysicalDisplayId & displayId, us_frame_s & frame) {
 
   frame.width = buffer -> getWidth();
   frame.height = buffer -> getHeight();
-  frame.format = V4L2_PIX_FMT_RGB32;
+  frame.format = V4L2_PIX_FMT_RGBA32;
   frame.stride = buffer -> getStride() * bytesPerPixel(buffer -> getPixelFormat());
   frame.used = static_cast < size_t > (frame.width) * static_cast < size_t > (frame.height) * bytesPerPixel(buffer -> getPixelFormat());
   frame.data = static_cast < uint8_t * > (malloc(frame.used));
@@ -161,35 +131,20 @@ void init_encoder_pool(int pool_size) {
 
 void encode_frame(us_m2m_encoder_s * encoder,
   const us_frame_s & input_frame, us_frame_s & output_frame) {
-  int width = input_frame.width;
-  int height = input_frame.height;
 
-  size_t rgb24_frame_size = static_cast < size_t > (width) * static_cast < size_t > (height) * 3;
-  uint8_t * rgb24_frame_data = static_cast < uint8_t * > (malloc(rgb24_frame_size));
-
-  rgb32_to_rgb24(input_frame.data, rgb24_frame_data, width, height);
-
-  us_frame_s rgb24_frame = input_frame;
-  rgb24_frame.format = V4L2_PIX_FMT_RGB24;
-  rgb24_frame.stride = width * 3;
-  rgb24_frame.used = rgb24_frame_size;
-  rgb24_frame.data = rgb24_frame_data;
-
-  output_frame.width = rgb24_frame.width;
-  output_frame.height = rgb24_frame.height;
+  output_frame.width = input_frame.width;
+  output_frame.height = input_frame.height;
   output_frame.format = V4L2_PIX_FMT_JPEG;
   output_frame.stride = 0;
   output_frame.used = 0;
   output_frame.data = NULL;
 
   bool force_key = false;
-  int compressionResult = us_m2m_encoder_compress(encoder, & rgb24_frame, & output_frame, force_key);
+  int compressionResult = us_m2m_encoder_compress(encoder, & input_frame, & output_frame, force_key);
 
   if (compressionResult != 0) {
     fprintf(stderr, "Failed to compress JPEG (error code: %d)\n", compressionResult);
   }
-
-  free(rgb24_frame_data);
 }
 
 void stream_frame(MJPEGStreamer & streamer,
