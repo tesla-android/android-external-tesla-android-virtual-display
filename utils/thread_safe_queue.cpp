@@ -1,6 +1,6 @@
-#include "thread_safe_queue.h"
-#include "frame.h"
-#include "m2m.h"
+#include "utils/thread_safe_queue.h"
+#include "encode/frame.h"
+#include "encode/m2m.h"
 
 template <typename T>
 void ThreadSafeQueue<T>::push(const T& value) {

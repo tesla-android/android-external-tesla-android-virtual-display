@@ -2,11 +2,12 @@ cc_binary {
     name: "tesla-android-virtual-display",
 
     srcs: [
-	"tesla-android-virtual-display.cpp",
-	"thread_safe_queue.cpp",
-	"m2m.c",
-	"frame.c",
-	"logging.c",
+		"tesla-android-virtual-display.cpp",
+		"capture/frame_waiter.cpp",
+		"utils/thread_safe_queue.cpp",
+		"encode/m2m.c",
+		"encode/frame.c",
+		"encode/logging.c",
     ],
 
     shared_libs: [
@@ -17,6 +18,7 @@ cc_binary {
         "libui",
         "libgui",
         "libjpeg",
+        "libEGL",
     ],
 
     cppflags: [
@@ -27,13 +29,10 @@ cc_binary {
         "-Wno-unused-parameter",
         "-Wno-uninitialized",
         "-Wno-unused-variable",
-        "-O3",
     ],
 
     cflags: [
-	"-Wall", 
-	"-Werror",
-	"-O3", 
-	"-g3",
+		"-Wall", 
+		"-Werror",
     ],
 }
