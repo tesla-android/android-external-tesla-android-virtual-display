@@ -54,9 +54,14 @@ using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 using namespace android;
 
-const int encoder_pool_size = 2;
+const int encoder_pool_size = 3;
 
 static FrameWaiter frameWaiter;
+
+std::mutex captureTimeMutex;
+
+std::chrono::time_point<std::chrono::system_clock> lastCaptureTime;
+
 
 ThreadSafeQueue < us_frame_s > capture_queue;
 ThreadSafeQueue < us_frame_s > encoded_queue;
@@ -91,6 +96,27 @@ void init_encoder_pool(int pool_size) {
     us_m2m_encoder_s * encoder = us_m2m_jpeg_encoder_init(encoder_name.c_str(), "/dev/video31", 80);
     encoder_pool.push(encoder);
   }
+}
+
+void update_last_capture_time() {
+    std::unique_lock<std::mutex> lock(captureTimeMutex);
+    auto currentTime = std::chrono::system_clock::now();
+    lastCaptureTime = currentTime;
+    lock.unlock();
+}
+
+bool should_take_screenshot() {
+    std::unique_lock<std::mutex> lock(captureTimeMutex);
+    auto currentTime = std::chrono::system_clock::now();
+    auto timeSinceLastCapture = currentTime - lastCaptureTime;
+    if (timeSinceLastCapture > std::chrono::milliseconds(100)) {
+        lastCaptureTime = currentTime;
+        lock.unlock();
+        return true;
+    } else {
+        lock.unlock();
+        return false;
+    }
 }
 
 void take_screenshot(PhysicalDisplayId & displayId, us_frame_s & frame) {
@@ -141,12 +167,14 @@ void screenshot_thread() {
   }
 
   while (true) {
-    us_frame_s frame;
-    take_screenshot( * displayId, frame);
-    if (frame.data != nullptr) {
-      capture_queue.push(frame);
+    if (should_take_screenshot()) {
+      us_frame_s frame;
+      take_screenshot( * displayId, frame);
+      if (frame.data != nullptr) {
+        capture_queue.push(frame);
+      }
     }
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
 }
 
@@ -213,7 +241,7 @@ void capture_thread() {
       memcpy(encoderFrame.data, capturedFrame.data, encoderFrame.used);
       
       capture_queue.push(encoderFrame);
-	   
+      update_last_capture_time();
       minicap->releaseConsumedFrame(&capturedFrame);
       
       haveFrame = false;
