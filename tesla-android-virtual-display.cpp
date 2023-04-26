@@ -73,7 +73,7 @@ void set_resolution() {
   char
   const * arg1 = "size";
   char
-  const * arg2 = "1056x768";
+  const * arg2 = "1088x832";
 
   pid_t pid;
   pid = fork();
