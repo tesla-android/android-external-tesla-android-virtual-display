@@ -38,30 +38,17 @@
 
 #include <thread>
 
-#include <arm_neon.h>
-
 #include "stream/mjpeg_streamer.hpp"
 
 #include "encode/m2m.h"
 
 #include "utils/thread_safe_queue.h"
 
-#include "capture/frame_waiter.h"
-
-#include "capture/minicap_impl.hpp"
-
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 using namespace android;
 
 const int encoder_pool_size = 3;
-
-static FrameWaiter frameWaiter;
-
-std::mutex captureTimeMutex;
-
-std::chrono::time_point<std::chrono::system_clock> lastCaptureTime;
-
 
 ThreadSafeQueue < us_frame_s > capture_queue;
 ThreadSafeQueue < us_frame_s > encoded_queue;
@@ -96,27 +83,6 @@ void init_encoder_pool(int pool_size) {
     us_m2m_encoder_s * encoder = us_m2m_jpeg_encoder_init(encoder_name.c_str(), "/dev/video31", 80);
     encoder_pool.push(encoder);
   }
-}
-
-void update_last_capture_time() {
-    std::unique_lock<std::mutex> lock(captureTimeMutex);
-    auto currentTime = std::chrono::system_clock::now();
-    lastCaptureTime = currentTime;
-    lock.unlock();
-}
-
-bool should_take_screenshot() {
-    std::unique_lock<std::mutex> lock(captureTimeMutex);
-    auto currentTime = std::chrono::system_clock::now();
-    auto timeSinceLastCapture = currentTime - lastCaptureTime;
-    if (timeSinceLastCapture > std::chrono::milliseconds(100)) {
-        lastCaptureTime = currentTime;
-        lock.unlock();
-        return true;
-    } else {
-        lock.unlock();
-        return false;
-    }
 }
 
 void take_screenshot(PhysicalDisplayId & displayId, us_frame_s & frame) {
@@ -167,85 +133,12 @@ void screenshot_thread() {
   }
 
   while (true) {
-    if (should_take_screenshot()) {
-      us_frame_s frame;
-      take_screenshot( * displayId, frame);
-      if (frame.data != nullptr) {
-        capture_queue.push(frame);
-      }
+    us_frame_s frame;
+    take_screenshot( * displayId, frame);
+    if (frame.data != nullptr) {
+      capture_queue.push(frame);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
-}
-
-void capture_thread() {
-  Minicap::DisplayInfo displayInfo;
-
-  if (minicap_try_get_display_info(0, &displayInfo) != 0) {
-	fprintf(stderr, "Failed to get info from internal display \n");
-    exit(1);
-  }
-
-  Minicap::Frame capturedFrame;
-  bool haveFrame = false;
-  
-  Minicap* minicap = minicap_create(0);
-  if (minicap == NULL) {
-	fprintf(stderr, "Failed to start display capture \n");
-    exit(1);
-  }
-  
-  if (minicap->setRealInfo(displayInfo) != 0) {
-    fprintf(stderr, "Minicap did not accept real display info \n");
-    exit(1);
-  }
-
-  if (minicap->setDesiredInfo(displayInfo) != 0) {
-    fprintf(stderr, "Minicap did not accept desired display info \n");
-    exit(1);
-  }
-  
-  minicap->setFrameAvailableListener(&frameWaiter);
-  
-  if (minicap->applyConfigChanges() != 0) {
-    fprintf(stderr, "Unable to start minicap with current config \n");
-    exit(1);
-  }
-  
-  int err;
-    while (true) {
-      if (!frameWaiter.waitForFrame()) {
-        fprintf(stderr, "Unable to wait for frame \n");
-        exit(1);
-      }
-      if ((err = minicap->consumePendingFrame(&capturedFrame)) != 0) {
-        if (err == -EINTR) {
-          fprintf(stderr, "Frame consumption interrupted by EINTR \n");
-          exit(1);
-        }
-        else {
-          fprintf(stderr, "Unable to consume pending frame \n");
-          exit(1);
-        }
-      }
-	  
-      haveFrame = true;
-	  
-      us_frame_s encoderFrame;
-      encoderFrame.width = capturedFrame.width;
-      encoderFrame.height = capturedFrame.height;
-      encoderFrame.format = V4L2_PIX_FMT_RGBA32;
-      encoderFrame.stride = capturedFrame.stride;
-      encoderFrame.used = capturedFrame.size;
-      encoderFrame.data = static_cast < uint8_t * > (malloc(encoderFrame.used));
-      memcpy(encoderFrame.data, capturedFrame.data, encoderFrame.used);
-      
-      capture_queue.push(encoderFrame);
-      update_last_capture_time();
-      minicap->releaseConsumedFrame(&capturedFrame);
-      
-      haveFrame = false;
-    }
 }
 
 void encode_frame(us_m2m_encoder_s * encoder, const us_frame_s & input_frame, us_frame_s & output_frame) {
@@ -305,14 +198,14 @@ void stream_thread() {
 }
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
-  minicap_start_thread_pool();
-
+  ProcessState::self() -> setThreadPoolMaxThreadCount(4);
+  ProcessState::self() -> startThreadPool();
+   
   set_resolution();
 
   init_encoder_pool(encoder_pool_size);
 
   std::thread t_screenshot(screenshot_thread);
-  std::thread t_capture(capture_thread);
   std::vector < std::thread > encode_threads(encoder_pool_size);
   for (int i = 0; i < encoder_pool_size; i++) {
     us_m2m_encoder_s * encoder = encoder_pool.pop();
@@ -321,7 +214,6 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   std::thread t_stream(stream_thread);
 
   t_screenshot.join();
-  t_capture.join();
   for (auto & t: encode_threads) {
     t.join();
   }
