@@ -38,50 +38,34 @@
 
 #include <thread>
 
-#include "stream/mjpeg_streamer.hpp"
-
 #include "encode/m2m.h"
 
 #include "utils/thread_safe_queue.h"
 
-using MJPEGStreamer = nadjieb::MJPEGStreamer;
+#include <ws.h>
 
 using namespace android;
 
-const int encoder_pool_size = 3;
+const int encoder_pool_size = 2;
 
 ThreadSafeQueue < us_frame_s > capture_queue;
-ThreadSafeQueue < us_frame_s > encoded_queue;
-ThreadSafeQueue < us_m2m_encoder_s * > encoder_pool;
+ThreadSafeQueue < encoded_frame_set > encoded_queue;
+ThreadSafeQueue < encoder_set > encoders_pool;
 
-void set_resolution() {
-  char
-  const * binaryPath = "/system/bin/wm";
-  char
-  const * arg1 = "size";
-  char
-  const * arg2 = "1088x832";
+encoder_set create_encoder_set(int num) {
+    encoder_set encoders;
 
-  pid_t pid;
-  pid = fork();
-  if (pid == -1) {
-    perror("fork failed");
-    exit(-1);
-  } else if (pid == 0) {
-    execlp(binaryPath, binaryPath, arg1, arg2, NULL);
-    perror("execlp failed");
-    exit(-1);
-  }
-  int status;
-  wait( & status);
-  printf("child exit status: %d\n", WEXITSTATUS(status));
+    std::string encoder_name_jpeg = "encoder_jpeg" + std::to_string(num);
+    //std::string encoder_name_h264 = "encoder_h264" + std::to_string(num);
+
+    //encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 1000, 30);
+    encoders.jpeg_encoder = us_m2m_jpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video31", 90);
+    return encoders;
 }
 
 void init_encoder_pool(int pool_size) {
   for (int i = 0; i < pool_size; i++) {
-    std::string encoder_name = "encoder" + std::to_string(i);
-    us_m2m_encoder_s * encoder = us_m2m_jpeg_encoder_init(encoder_name.c_str(), "/dev/video31", 80);
-    encoder_pool.push(encoder);
+    encoders_pool.push(create_encoder_set(i));
   }
 }
 
@@ -141,7 +125,7 @@ void screenshot_thread() {
   }
 }
 
-void encode_frame(us_m2m_encoder_s * encoder, const us_frame_s & input_frame, us_frame_s & output_frame) {
+void encode_frame_jpeg(us_m2m_encoder_s * encoder, const us_frame_s & input_frame, us_frame_s & output_frame) {
   output_frame.width = input_frame.width;
   output_frame.height = input_frame.height;
   output_frame.format = V4L2_PIX_FMT_JPEG;
@@ -157,18 +141,42 @@ void encode_frame(us_m2m_encoder_s * encoder, const us_frame_s & input_frame, us
   }
 }
 
-void encode_thread(us_m2m_encoder_s * encoder) {
+void encode_frame_h264(us_m2m_encoder_s * encoder, const us_frame_s & input_frame, us_frame_s & output_frame) {
+  output_frame.width = input_frame.width;
+  output_frame.height = input_frame.height;
+  output_frame.format = V4L2_PIX_FMT_H264;
+  output_frame.stride = 0;
+  output_frame.used = 0;
+  output_frame.data = NULL;
+
+  bool force_key = false;
+  int compressionResult = us_m2m_encoder_compress(encoder, & input_frame, & output_frame, force_key);
+
+  if (compressionResult != 0) {
+    fprintf(stderr, "Failed to compress JPEG (error code: %d)\n", compressionResult);
+  }
+}
+
+void encode_thread(encoder_set encoders) {
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
     if (input_frame.data != nullptr) {
-      us_frame_s encoded_frame;
-      encode_frame(encoder, input_frame, encoded_frame);
+      us_frame_s encoded_frame_jpeg;
+      encode_frame_jpeg(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg);
 
-      if (encoded_frame.data != nullptr) {
-        encoded_queue.push(encoded_frame);
+      //us_frame_s encoded_frame_h264;
+      //encode_frame_h264(encoders.h264_encoder, input_frame, encoded_frame_h264);
+
+      encoded_frame_set encoded_frames;
+      encoded_frames.jpeg_frame = encoded_frame_jpeg;
+      //encoded_frames.h264_frame = encoded_frame_h264;
+
+      if (encoded_frame_jpeg.data != nullptr) {
+        encoded_queue.push(encoded_frames);
       } else {
         std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
       }
+
       free(input_frame.data);
     } else {
       std::cout << "encode_thread(): Input frame data is null" << std::endl; 
@@ -176,42 +184,78 @@ void encode_thread(us_m2m_encoder_s * encoder) {
   }
 }
 
-void stream_frame(MJPEGStreamer & streamer, const us_frame_s & encoded_frame) {
-  std::string frameData(reinterpret_cast < char * > (encoded_frame.data), encoded_frame.used);
-  streamer.publish("/stream", frameData);
-  free(encoded_frame.data);
+void stream_frame(const encoded_frame_set & encoded_frames) {
+  ws_sendframe_bin(NULL, reinterpret_cast<const char*>(encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
+}
+
+void ws_on_connection_opened(ws_cli_conn_t *client) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Connection opened, addr: %s\n", cli);
+}
+
+void ws_on_connection_closed(ws_cli_conn_t *client) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Connection closed, addr: %s\n", cli);
+}
+
+void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
+       __attribute__ ((unused)) const unsigned char *msg,
+       __attribute__ ((unused)) uint64_t size,
+       __attribute__ ((unused)) int type) {
+  ws_ping(NULL, 30);
 }
 
 void stream_thread() {
-  MJPEGStreamer streamer;
-  streamer.start(9090, 4);
+  us_frame_s last_frame_jpeg;
+  bool has_last_frame = false;
+  int drop_counter = 0;
+  const int drop_limit = 30;
 
   while (true) {
-    us_frame_s encoded_frame = encoded_queue.pop();
-    if (encoded_frame.data != nullptr) {
-      stream_frame(streamer, encoded_frame);
-    } else {
-      std::cout << "stream_thread(): Encoded frame data is null" << std::endl;
-      free(encoded_frame.data);
+    encoded_frame_set encoded_frames = encoded_queue.pop();
+
+    if (has_last_frame &&
+        (us_frame_compare(&last_frame_jpeg, &encoded_frames.jpeg_frame)) &&
+        drop_counter < drop_limit) {
+      drop_counter++;
+      free(encoded_frames.jpeg_frame.data);
+      //free(encoded_frames.h264_frame.data);
+      continue;
     }
+
+    drop_counter = 0;
+
+    stream_frame(encoded_frames);
+
+    us_frame_copy(&encoded_frames.jpeg_frame, &last_frame_jpeg);
+    has_last_frame = true;
+
+    free(encoded_frames.jpeg_frame.data);
+    //free(encoded_frames.h264_frame.data);
   }
 }
+
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   ProcessState::self() -> setThreadPoolMaxThreadCount(4);
   ProcessState::self() -> startThreadPool();
-   
-  set_resolution();
 
   init_encoder_pool(encoder_pool_size);
 
   std::thread t_screenshot(screenshot_thread);
   std::vector < std::thread > encode_threads(encoder_pool_size);
   for (int i = 0; i < encoder_pool_size; i++) {
-    us_m2m_encoder_s * encoder = encoder_pool.pop();
-    encode_threads[i] = std::thread(encode_thread, encoder);
+    encode_threads[i] = std::thread(encode_thread, encoders_pool.pop());
   }
   std::thread t_stream(stream_thread);
+
+  struct ws_events evs;
+  evs.onopen    = &ws_on_connection_opened;
+  evs.onclose   = &ws_on_connection_closed;
+  evs.onmessage = &ws_on_message;
+  ws_socket(&evs, 9090, 0, 0);
 
   t_screenshot.join();
   for (auto & t: encode_threads) {
