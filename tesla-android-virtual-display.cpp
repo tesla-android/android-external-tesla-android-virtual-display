@@ -56,11 +56,10 @@ encoder_set create_encoder_set(int num) {
     encoder_set encoders;
 
     std::string encoder_name_jpeg = "encoder_jpeg" + std::to_string(num);
-    std::string encoder_name_h264 = "encoder_h264" + std::to_string(num);
+    //std::string encoder_name_h264 = "encoder_h264" + std::to_string(num);
 
-    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 1000, 30);
-    encoders.jpeg_encoder = us_m2m_jpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video31", 80);
-
+    //encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 1000, 30);
+    encoders.jpeg_encoder = us_m2m_jpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video31", 90);
     return encoders;
 }
 
@@ -165,14 +164,14 @@ void encode_thread(encoder_set encoders) {
       us_frame_s encoded_frame_jpeg;
       encode_frame_jpeg(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg);
 
-      us_frame_s encoded_frame_h264;
-      encode_frame_h264(encoders.h264_encoder, input_frame, encoded_frame_h264);
+      //us_frame_s encoded_frame_h264;
+      //encode_frame_h264(encoders.h264_encoder, input_frame, encoded_frame_h264);
 
       encoded_frame_set encoded_frames;
       encoded_frames.jpeg_frame = encoded_frame_jpeg;
-      encoded_frames.h264_frame = encoded_frame_h264;
+      //encoded_frames.h264_frame = encoded_frame_h264;
 
-	  if (encoded_frame_jpeg.data != nullptr && encoded_frame_h264.data != nullptr) {
+      if (encoded_frame_jpeg.data != nullptr) {
         encoded_queue.push(encoded_frames);
       } else {
         std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
@@ -187,8 +186,6 @@ void encode_thread(encoder_set encoders) {
 
 void stream_frame(const encoded_frame_set & encoded_frames) {
   ws_sendframe_bin(NULL, reinterpret_cast<const char*>(encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
-  free(encoded_frames.jpeg_frame.data);
-  free(encoded_frames.h264_frame.data);
 }
 
 void ws_on_connection_opened(ws_cli_conn_t *client) {
@@ -207,21 +204,39 @@ void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
        __attribute__ ((unused)) const unsigned char *msg,
        __attribute__ ((unused)) uint64_t size,
        __attribute__ ((unused)) int type) {
-  ws_ping(NULL, 5);
+  ws_ping(NULL, 30);
 }
 
 void stream_thread() {
+  us_frame_s last_frame_jpeg;
+  bool has_last_frame = false;
+  int drop_counter = 0;
+  const int drop_limit = 30;
+
   while (true) {
     encoded_frame_set encoded_frames = encoded_queue.pop();
-    if (encoded_frames.jpeg_frame.data != nullptr) {
-      stream_frame(encoded_frames);
-    } else {
-      std::cout << "stream_thread(): Encoded frame data is null" << std::endl;
-  	  free(encoded_frames.jpeg_frame.data);
-  	  free(encoded_frames.h264_frame.data);
+
+    if (has_last_frame &&
+        (us_frame_compare(&last_frame_jpeg, &encoded_frames.jpeg_frame)) &&
+        drop_counter < drop_limit) {
+      drop_counter++;
+      free(encoded_frames.jpeg_frame.data);
+      //free(encoded_frames.h264_frame.data);
+      continue;
     }
+
+    drop_counter = 0;
+
+    stream_frame(encoded_frames);
+
+    us_frame_copy(&encoded_frames.jpeg_frame, &last_frame_jpeg);
+    has_last_frame = true;
+
+    free(encoded_frames.jpeg_frame.data);
+    //free(encoded_frames.h264_frame.data);
   }
 }
+
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   ProcessState::self() -> setThreadPoolMaxThreadCount(4);
