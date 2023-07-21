@@ -21,6 +21,4 @@ T ThreadSafeQueue<T>::pop() {
 
 // Explicit template instantiation each type used with ThreadSafeQueue
 template class ThreadSafeQueue<us_frame_s>;
-template class ThreadSafeQueue<encoded_frame_set>;
-template class ThreadSafeQueue<encoder_set>;
 

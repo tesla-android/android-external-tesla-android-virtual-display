@@ -62,12 +62,12 @@ typedef struct {
 typedef struct {
     us_m2m_encoder_s *h264_encoder;
     us_m2m_encoder_s *jpeg_encoder;
-} encoder_set;
+} us_encoder_set;
 
 typedef struct {
     us_frame_s h264_frame;
     us_frame_s jpeg_frame;
-} encoded_frame_set;
+} us_encoded_frame_set;
 
 us_m2m_encoder_s *us_m2m_h264_encoder_init(const char *name, const char *path, unsigned bitrate, unsigned gop);
 us_m2m_encoder_s *us_m2m_mjpeg_encoder_init(const char *name, const char *path, unsigned quality);
