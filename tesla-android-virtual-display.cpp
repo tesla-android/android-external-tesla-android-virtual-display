@@ -38,6 +38,8 @@
 
 #include <thread>
 
+#include <cutils/properties.h>
+
 #include "stream/mjpeg_streamer.hpp"
 
 #include "encode/m2m.h"
@@ -54,27 +56,19 @@ ThreadSafeQueue < us_frame_s > capture_queue;
 ThreadSafeQueue < us_frame_s > encoded_queue;
 ThreadSafeQueue < us_m2m_encoder_s * > encoder_pool;
 
-void set_resolution() {
-  char
-  const * binaryPath = "/system/bin/wm";
-  char
-  const * arg1 = "size";
-  char
-  const * arg2 = "1088x832";
+int isVariableRefresh = 0;
 
-  pid_t pid;
-  pid = fork();
-  if (pid == -1) {
-    perror("fork failed");
-    exit(-1);
-  } else if (pid == 0) {
-    execlp(binaryPath, binaryPath, arg1, arg2, NULL);
-    perror("execlp failed");
-    exit(-1);
+int get_system_property_int(const char *prop_name)
+{
+  char prop_value[PROPERTY_VALUE_MAX];
+  if (property_get(prop_name, prop_value, nullptr) > 0)
+  {
+    return atoi(prop_value);
   }
-  int status;
-  wait( & status);
-  printf("child exit status: %d\n", WEXITSTATUS(status));
+  else
+  {
+    return -1;
+  }
 }
 
 void init_encoder_pool(int pool_size) {
@@ -192,18 +186,42 @@ void stream_thread() {
       stream_frame(streamer, encoded_frame);
     } else {
       std::cout << "stream_thread(): Encoded frame data is null" << std::endl;
-      free(encoded_frame.data);
     }
+  }
+}
+
+void stream_thread_variable_refresh() {
+  MJPEGStreamer streamer;
+  streamer.start(9090, 4);
+
+  us_frame_s last_frame_jpeg;
+  bool has_last_frame = false;
+  int drop_counter = 0;
+  const int drop_limit = 30;   
+
+  while (true) {
+    us_frame_s encoded_frame = encoded_queue.pop();
+    if (has_last_frame &&
+       (us_frame_compare(&last_frame_jpeg, &encoded_frame)) &&
+       drop_counter < drop_limit) {
+         drop_counter++;
+         free(encoded_frame.data);
+         continue;
+    }
+    drop_counter = 0;
+    stream_frame(streamer, encoded_frame);
+    us_frame_copy(&encoded_frame, &last_frame_jpeg);
+    has_last_frame = true;
   }
 }
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   ProcessState::self() -> setThreadPoolMaxThreadCount(4);
   ProcessState::self() -> startThreadPool();
-   
-  set_resolution();
 
   init_encoder_pool(encoder_pool_size);
+
+  isVariableRefresh = get_system_property_int("persist.tesla-android.virtual-display.is_variable_refresh");
 
   std::thread t_screenshot(screenshot_thread);
   std::vector < std::thread > encode_threads(encoder_pool_size);
@@ -211,13 +229,18 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
     us_m2m_encoder_s * encoder = encoder_pool.pop();
     encode_threads[i] = std::thread(encode_thread, encoder);
   }
-  std::thread t_stream(stream_thread);
+  if (isVariableRefresh == 1){
+    std::thread t_stream(stream_thread_variable_refresh);
+    t_stream.join();
+  } else {
+    std::thread t_stream(stream_thread);
+    t_stream.join();
+  }
 
   t_screenshot.join();
   for (auto & t: encode_threads) {
     t.join();
   }
-  t_stream.join();
 
   return 0;
 }
