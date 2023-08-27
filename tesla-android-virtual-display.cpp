@@ -197,7 +197,7 @@ void stream_thread_variable_refresh() {
   us_frame_s last_frame_jpeg;
   bool has_last_frame = false;
   int drop_counter = 0;
-  const int drop_limit = 30;   
+  const int drop_limit = 15;   
 
   while (true) {
     us_frame_s encoded_frame = encoded_queue.pop();
