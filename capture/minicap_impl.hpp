@@ -13,7 +13,7 @@
 #include <binder/IMemory.h>
 
 #include <gui/BufferQueue.h>
-#include <gui/CpuConsumer.h>
+#include <gui/BufferItemConsumer.h>
 #include <gui/ISurfaceComposer.h>
 #include <gui/Surface.h>
 #include <gui/SurfaceComposerClient.h>
@@ -118,23 +118,27 @@ public:
   consumePendingFrame(Minicap::Frame* frame) {
     android::status_t err;
 
-    if ((err = mConsumer->lockNextBuffer(&mBuffer)) != android::NO_ERROR) {
+    if ((err = mConsumer->acquireBuffer(&mBuffer, 0)) != android::NO_ERROR) {
       if (err == -EINTR) {
         return err;
       }
       else {
-        printf("Unable to lock next buffer %s (%d) \n", error_name(err), err);
+        printf("Unable to acquire buffer %s (%d) \n", error_name(err), err);
         return err;
       }
     }
 
-    frame->data = mBuffer.data;
-    frame->format = convertFormat(mBuffer.format);
-    frame->width = mBuffer.width;
-    frame->height = mBuffer.height;
-    frame->stride = mBuffer.stride;
-    frame->bpp = android::bytesPerPixel(mBuffer.format);
-    frame->size = mBuffer.stride * mBuffer.height * frame->bpp;
+    android::sp<android::GraphicBuffer> graphicBuffer = mBuffer.mGraphicBuffer;
+
+    frame->width = graphicBuffer->getWidth();
+    frame->height = graphicBuffer->getHeight();
+    frame->stride = graphicBuffer->getStride();
+    frame->format = convertFormat(graphicBuffer->getPixelFormat());
+    frame->bpp = android::bytesPerPixel(graphicBuffer->getPixelFormat());
+    frame->size = frame->stride * frame->height * frame->bpp;
+
+    ANativeWindowBuffer* b = graphicBuffer->getNativeBuffer();
+    frame->dma_fd = b->handle->data[0];
 
     mHaveBuffer = true;
 
@@ -159,7 +163,7 @@ public:
   virtual void
   releaseConsumedFrame(Minicap::Frame* /* frame */) {
     if (mHaveBuffer) {
-      mConsumer->unlockBuffer(mBuffer);
+      mConsumer->releaseBuffer(mBuffer);
       mHaveBuffer = false;
     }
   }
@@ -193,13 +197,13 @@ private:
   uint8_t mDesiredOrientation;
   android::sp<android::IGraphicBufferProducer> mBufferProducer;
   android::sp<android::IGraphicBufferConsumer> mBufferConsumer;
-  android::sp<android::CpuConsumer> mConsumer;
+  android::sp<android::BufferItemConsumer> mConsumer;
   android::sp<android::IBinder> mVirtualDisplay;
   android::sp<FrameProxy> mFrameProxy;
   Minicap::FrameAvailableListener* mUserFrameAvailableListener;
   bool mHaveBuffer;
   bool mHaveRunningDisplay;
-  android::CpuConsumer::LockedBuffer mBuffer;
+  android::BufferItem mBuffer;
 
   int
   createVirtualDisplay() {
@@ -257,7 +261,7 @@ private:
     printf("Creating virtual display \n");
     mVirtualDisplay = android::SurfaceComposerClient::createDisplay(
       /* const String8& displayName */  android::String8("minicap"),
-      /* bool secure */                 true
+      /* bool secure */                 false // can't change to true without a framework patch
     );
 
     printf("Creating buffer queue \n");
@@ -268,7 +272,7 @@ private:
     mBufferConsumer->setDefaultBufferFormat(android::PIXEL_FORMAT_RGBA_8888);
 
     printf("Creating CPU consumer \n");
-    mConsumer = new android::CpuConsumer(mBufferConsumer, 3, false);
+    mConsumer = new android::BufferItemConsumer(mBufferConsumer, GRALLOC_USAGE_HW_VIDEO_ENCODER);
     mConsumer->setName(android::String8("minicap"));
 
     printf("Creating frame waiter \n");
@@ -294,7 +298,7 @@ private:
     android::SurfaceComposerClient::destroyDisplay(mVirtualDisplay);
 
     if (mHaveBuffer) {
-      mConsumer->unlockBuffer(mBuffer);
+      mConsumer->releaseBuffer(mBuffer);
       mHaveBuffer = false;
     }
 

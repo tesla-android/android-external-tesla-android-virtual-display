@@ -19,7 +19,6 @@ cc_binary {
         "libgui",
         "libjpeg",
         "libEGL",
-	"libws",
     ],
 
     cppflags: [
@@ -33,11 +32,7 @@ cc_binary {
     ],
 
     cflags: [
-	"-Wall", 
-	"-Werror",
-    ],
-
-    include_dirs: [
-	"external/libws",
+		"-Wall", 
+		"-Werror",
     ],
 }

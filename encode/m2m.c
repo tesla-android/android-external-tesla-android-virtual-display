@@ -42,7 +42,7 @@ us_m2m_encoder_s *us_m2m_mjpeg_encoder_init(const char *name, const char *path, 
 	bitrate *= 1000; // From Kbps
 	assert(bitrate > 0);
 	// FIXME: То же самое про 30 or 0, но еще даже не проверено на низких разрешениях
-	return _m2m_encoder_init(name, path, V4L2_PIX_FMT_MJPEG, 30, bitrate, 0, 0, false);
+	return _m2m_encoder_init(name, path, V4L2_PIX_FMT_MJPEG, 30, bitrate, 0, 0, true);
 }
 
 us_m2m_encoder_s *us_m2m_jpeg_encoder_init(const char *name, const char *path, unsigned quality) {
