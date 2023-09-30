@@ -50,6 +50,8 @@
 
 #include "stream/mjpeg_streamer.hpp"
 
+#include <atomic>
+
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 using namespace android;
@@ -64,6 +66,13 @@ ThreadSafeQueue < us_frame_s > capture_queue;
 us_encoder_set encoders;
 
 int isH264 = 0;
+
+std::mutex last_encoded_frame_mutex;
+us_frame_s last_encoded_frame;
+
+std::atomic<bool> new_frame_captured(false);
+
+MJPEGStreamer streamer;
 
 int get_system_property_int(const char * prop_name) {
   char prop_value[PROPERTY_VALUE_MAX];
@@ -143,6 +152,7 @@ void capture_thread() {
     encoderFrame.force_key_on_encode = false;
     encoderFrame.dma_fd = capturedFrame.dma_fd;
 
+    new_frame_captured.store(true);
     capture_queue.push(encoderFrame);
 
     minicap -> releaseConsumedFrame( & capturedFrame);
@@ -167,16 +177,12 @@ void encode_frame(us_m2m_encoder_s * encoder,
 }
 
 void encode_thread() {
-
-  MJPEGStreamer streamer;
-  streamer.start(9090, 4);
-
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
     us_frame_s encoded_frame_h264;
     us_frame_s encoded_frame_jpeg;
-
     us_encoded_frame_set encoded_frames;
+
     if (isH264) {
       encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
       encoded_frames.h264_frame = encoded_frame_h264;
@@ -187,9 +193,17 @@ void encode_thread() {
 
     if (encoded_frame_jpeg.data != nullptr || encoded_frame_h264.data != nullptr) {
       if (isH264) {
-        // just encode and deallocate, enough to check logs for encoding issues
         free(encoded_frames.h264_frame.data);
       } else {
+        last_encoded_frame_mutex.lock();
+        if (last_encoded_frame.data != nullptr) {
+        	free(last_encoded_frame.data);
+        }
+        last_encoded_frame = encoded_frames.jpeg_frame;
+        last_encoded_frame.data = static_cast < uint8_t * > (malloc(encoded_frames.jpeg_frame.used));
+        memcpy(last_encoded_frame.data, encoded_frames.jpeg_frame.data, last_encoded_frame.used);
+        last_encoded_frame_mutex.unlock();
+
         std::string frameData(reinterpret_cast < char * > (encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
         streamer.publish("/stream", frameData);
         free(encoded_frames.jpeg_frame.data);
@@ -197,23 +211,42 @@ void encode_thread() {
     } else {
       std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
     }
-
     free(input_frame.data);
-
   }
+}
+
+void broadcast_thread() {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (!new_frame_captured.load()) {
+        last_encoded_frame_mutex.lock();
+        if (last_encoded_frame.data != nullptr) {
+            std::string frameData(reinterpret_cast<char*>(last_encoded_frame.data), last_encoded_frame.used);
+            streamer.publish("/stream", frameData);
+        }
+        last_encoded_frame_mutex.unlock();
+    }
+    new_frame_captured.store(false);
+    }
 }
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   minicap_start_thread_pool();
+  streamer.start(9090, 4);
 
   isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
 
+  last_encoded_frame.data = nullptr;
+
   createEncoders();
 
-  std::thread t_capture(capture_thread);
-  std::thread t_encode(encode_thread);
-  t_capture.join();
-  t_encode.join();
+  std::thread captureT(capture_thread);
+  std::thread encodeT(encode_thread);
+  std::thread broadcastT(broadcast_thread);
+
+  captureT.join();
+  encodeT.join();
+  broadcastT.join();
 
   return 0;
 }
