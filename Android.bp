@@ -2,12 +2,12 @@ cc_binary {
     name: "tesla-android-virtual-display",
 
     srcs: [
-		"tesla-android-virtual-display.cpp",
-		"capture/frame_waiter.cpp",
-		"utils/thread_safe_queue.cpp",
-		"encode/m2m.c",
-		"encode/frame.c",
-		"encode/logging.c",
+	"tesla-android-virtual-display.cpp",
+	"capture/frame_waiter.cpp",
+	"utils/thread_safe_queue.cpp",
+	"encode/m2m.c",
+	"encode/frame.c",
+	"encode/logging.c",
     ],
 
     shared_libs: [

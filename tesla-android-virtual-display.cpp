@@ -38,209 +38,182 @@
 
 #include <thread>
 
-#include <cutils/properties.h>
-
-#include "stream/mjpeg_streamer.hpp"
-
 #include "encode/m2m.h"
 
 #include "utils/thread_safe_queue.h"
+
+#include <cutils/properties.h>
+
+#include "capture/frame_waiter.h"
+
+#include "capture/minicap_impl.hpp"
+
+#include "stream/mjpeg_streamer.hpp"
 
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 using namespace android;
 
-const int encoder_pool_size = 3;
+// Having more than 1 encoder makes sense only for mjpeg
+const int encoder_pool_size = 1;
+
+static FrameWaiter frameWaiter;
 
 ThreadSafeQueue < us_frame_s > capture_queue;
-ThreadSafeQueue < us_frame_s > encoded_queue;
-ThreadSafeQueue < us_m2m_encoder_s * > encoder_pool;
 
-int isVariableRefresh = 0;
+us_encoder_set encoders;
 
-int get_system_property_int(const char *prop_name)
-{
+int isH264 = 0;
+
+int get_system_property_int(const char * prop_name) {
   char prop_value[PROPERTY_VALUE_MAX];
-  if (property_get(prop_name, prop_value, nullptr) > 0)
-  {
+  if (property_get(prop_name, prop_value, nullptr) > 0) {
     return atoi(prop_value);
-  }
-  else
-  {
+  } else {
     return -1;
   }
 }
 
-void init_encoder_pool(int pool_size) {
-  for (int i = 0; i < pool_size; i++) {
-    std::string encoder_name = "encoder" + std::to_string(i);
-    us_m2m_encoder_s * encoder = us_m2m_jpeg_encoder_init(encoder_name.c_str(), "/dev/video31", 80);
-    encoder_pool.push(encoder);
+void createEncoders() {
+  if (isH264) {
+    std::string encoder_name_h264 = "encoder_h264";
+    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 20000, 30);
+  } else {
+    std::string encoder_name_jpeg = "encoder_jpeg";
+    encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", 90);
   }
 }
 
-void take_screenshot(PhysicalDisplayId & displayId, us_frame_s & frame) {
-  void * base = NULL;
+void capture_thread() {
+  Minicap::DisplayInfo displayInfo;
 
-  sp < SyncScreenCaptureListener > captureListener = new SyncScreenCaptureListener();
-  status_t result = ScreenshotClient::captureDisplay(displayId, captureListener);
-  if (result != NO_ERROR) {
-    return;
-  }
-
-  ScreenCaptureResults captureResults = captureListener -> waitForResults();
-  if (captureResults.result != NO_ERROR) {
-    return;
-  }
-  ui::Dataspace dataspace = captureResults.capturedDataspace;
-  sp < GraphicBuffer > buffer = captureResults.buffer;
-
-  result = buffer -> lock(GraphicBuffer::USAGE_SW_READ_OFTEN, & base);
-
-  if (base == nullptr || result != NO_ERROR) {
-    String8 reason;
-    if (result != NO_ERROR) {
-      reason.appendFormat(" Error Code: %d", result);
-    } else {
-      reason = "Failed to write to buffer";
-    }
-    fprintf(stderr, "Failed to take screenshot (%s)\n", reason.c_str());
-    return;
-  }
-
-  frame.width = buffer -> getWidth();
-  frame.height = buffer -> getHeight();
-  frame.format = V4L2_PIX_FMT_RGBA32;
-  frame.stride = buffer -> getStride() * bytesPerPixel(buffer -> getPixelFormat());
-  frame.used = static_cast < size_t > (frame.width) * static_cast < size_t > (frame.height) * bytesPerPixel(buffer -> getPixelFormat());
-  frame.data = static_cast < uint8_t * > (malloc(frame.used));
-  memcpy(frame.data, base, frame.used);
-
-  buffer -> unlock();
-}
-
-void screenshot_thread() {
-  std::optional < PhysicalDisplayId > displayId = SurfaceComposerClient::getInternalDisplayId();
-  if (!displayId) {
-    fprintf(stderr, "Failed to get token for internal display\n");
+  if (minicap_try_get_display_info(0, & displayInfo) != 0) {
+    fprintf(stderr, "Failed to get info from internal display \n");
     exit(1);
   }
 
+  Minicap::Frame capturedFrame;
+  bool haveFrame = false;
+
+  Minicap * minicap = minicap_create(0);
+  if (minicap == NULL) {
+    fprintf(stderr, "Failed to start display capture \n");
+    exit(1);
+  }
+
+  if (minicap -> setRealInfo(displayInfo) != 0) {
+    fprintf(stderr, "Minicap did not accept real display info \n");
+    exit(1);
+  }
+
+  if (minicap -> setDesiredInfo(displayInfo) != 0) {
+    fprintf(stderr, "Minicap did not accept desired display info \n");
+    exit(1);
+  }
+
+  minicap -> setFrameAvailableListener( & frameWaiter);
+
+  if (minicap -> applyConfigChanges() != 0) {
+    fprintf(stderr, "Unable to start minicap with current config \n");
+    exit(1);
+  }
+
+  int err;
   while (true) {
-    us_frame_s frame;
-    take_screenshot( * displayId, frame);
-    if (frame.data != nullptr) {
-      capture_queue.push(frame);
+    if (!frameWaiter.waitForFrame()) {
+      fprintf(stderr, "Unable to wait for frame \n");
+      exit(1);
     }
+    if ((err = minicap -> consumePendingFrame( & capturedFrame)) != 0) {
+      if (err == -EINTR) {
+        fprintf(stderr, "Frame consumption interrupted by EINTR \n");
+        exit(1);
+      } else {
+        fprintf(stderr, "Unable to consume pending frame \n");
+        exit(1);
+      }
+    }
+
+    us_frame_s encoderFrame;
+    encoderFrame.width = capturedFrame.width;
+    encoderFrame.height = capturedFrame.height;
+    encoderFrame.format = V4L2_PIX_FMT_BGR32;
+    encoderFrame.stride = capturedFrame.stride;
+    encoderFrame.used = capturedFrame.size;
+    encoderFrame.force_key_on_encode = false;
+    encoderFrame.dma_fd = capturedFrame.dma_fd;
+
+    capture_queue.push(encoderFrame);
+
+    minicap -> releaseConsumedFrame( & capturedFrame);
   }
 }
 
-void encode_frame(us_m2m_encoder_s * encoder, const us_frame_s & input_frame, us_frame_s & output_frame) {
+void encode_frame(us_m2m_encoder_s * encoder,
+  const us_frame_s & input_frame, us_frame_s & output_frame, unsigned format) {
   output_frame.width = input_frame.width;
   output_frame.height = input_frame.height;
-  output_frame.format = V4L2_PIX_FMT_JPEG;
+  output_frame.format = format;
   output_frame.stride = 0;
   output_frame.used = 0;
   output_frame.data = NULL;
+  output_frame.force_key_on_encode = false;
 
-  bool force_key = false;
-  int compressionResult = us_m2m_encoder_compress(encoder, & input_frame, & output_frame, force_key);
+  int compression_result = us_m2m_encoder_compress(encoder, & input_frame, & output_frame, input_frame.force_key_on_encode);
 
-  if (compressionResult != 0) {
-    fprintf(stderr, "Failed to compress JPEG (error code: %d)\n", compressionResult);
+  if (compression_result != 0) {
+    fprintf(stderr, "Failed to compress frame (error code: %d)\n", compression_result);
   }
 }
 
-void encode_thread(us_m2m_encoder_s * encoder) {
+void encode_thread() {
+
+  MJPEGStreamer streamer;
+  streamer.start(9090, 4);
+
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
-    if (input_frame.data != nullptr) {
-      us_frame_s encoded_frame;
-      encode_frame(encoder, input_frame, encoded_frame);
+    us_frame_s encoded_frame_h264;
+    us_frame_s encoded_frame_jpeg;
 
-      if (encoded_frame.data != nullptr) {
-        encoded_queue.push(encoded_frame);
+    us_encoded_frame_set encoded_frames;
+    if (isH264) {
+      encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
+      encoded_frames.h264_frame = encoded_frame_h264;
+    } else {
+      encode_frame(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg, V4L2_PIX_FMT_JPEG);
+      encoded_frames.jpeg_frame = encoded_frame_jpeg;
+    }
+
+    if (encoded_frame_jpeg.data != nullptr || encoded_frame_h264.data != nullptr) {
+      if (isH264) {
+        // just encode and deallocate, enough to check logs for encoding issues
+        free(encoded_frames.h264_frame.data);
       } else {
-        std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
+        std::string frameData(reinterpret_cast < char * > (encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
+        streamer.publish("/stream", frameData);
+        free(encoded_frames.jpeg_frame.data);
       }
-      free(input_frame.data);
     } else {
-      std::cout << "encode_thread(): Input frame data is null" << std::endl; 
+      std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
     }
-  }
-}
 
-void stream_frame(MJPEGStreamer & streamer, const us_frame_s & encoded_frame) {
-  std::string frameData(reinterpret_cast < char * > (encoded_frame.data), encoded_frame.used);
-  streamer.publish("/stream", frameData);
-  free(encoded_frame.data);
-}
+    free(input_frame.data);
 
-void stream_thread() {
-  MJPEGStreamer streamer;
-  streamer.start(9090, 4);
-
-  while (true) {
-    us_frame_s encoded_frame = encoded_queue.pop();
-    if (encoded_frame.data != nullptr) {
-      stream_frame(streamer, encoded_frame);
-    } else {
-      std::cout << "stream_thread(): Encoded frame data is null" << std::endl;
-    }
-  }
-}
-
-void stream_thread_variable_refresh() {
-  MJPEGStreamer streamer;
-  streamer.start(9090, 4);
-
-  us_frame_s last_frame_jpeg;
-  bool has_last_frame = false;
-  int drop_counter = 0;
-  const int drop_limit = 15;   
-
-  while (true) {
-    us_frame_s encoded_frame = encoded_queue.pop();
-    if (has_last_frame &&
-       (us_frame_compare(&last_frame_jpeg, &encoded_frame)) &&
-       drop_counter < drop_limit) {
-         drop_counter++;
-         free(encoded_frame.data);
-         continue;
-    }
-    drop_counter = 0;
-    stream_frame(streamer, encoded_frame);
-    us_frame_copy(&encoded_frame, &last_frame_jpeg);
-    has_last_frame = true;
   }
 }
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
-  ProcessState::self() -> setThreadPoolMaxThreadCount(4);
-  ProcessState::self() -> startThreadPool();
+  minicap_start_thread_pool();
 
-  init_encoder_pool(encoder_pool_size);
+  isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
 
-  isVariableRefresh = get_system_property_int("persist.tesla-android.virtual-display.is_variable_refresh");
+  createEncoders();
 
-  std::thread t_screenshot(screenshot_thread);
-  std::vector < std::thread > encode_threads(encoder_pool_size);
-  for (int i = 0; i < encoder_pool_size; i++) {
-    us_m2m_encoder_s * encoder = encoder_pool.pop();
-    encode_threads[i] = std::thread(encode_thread, encoder);
-  }
-  if (isVariableRefresh == 1){
-    std::thread t_stream(stream_thread_variable_refresh);
-    t_stream.join();
-  } else {
-    std::thread t_stream(stream_thread);
-    t_stream.join();
-  }
-
-  t_screenshot.join();
-  for (auto & t: encode_threads) {
-    t.join();
-  }
+  std::thread t_capture(capture_thread);
+  std::thread t_encode(encode_thread);
+  t_capture.join();
+  t_encode.join();
 
   return 0;
 }

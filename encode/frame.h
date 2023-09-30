@@ -30,6 +30,7 @@ typedef struct {
 	// https://www.kernel.org/doc/html/v4.14/media/uapi/v4l/pixfmt-v4l2.html
 	// https://medium.com/@oleg.shipitko/what-does-stride-mean-in-image-processing-bba158a72bcd
 
+	bool 		force_key_on_encode;
 	bool		online;
 	bool		key;
 	unsigned	gop;
@@ -45,6 +46,7 @@ typedef struct {
 		x_dest->height = x_src->height; \
 		x_dest->format = x_src->format; \
 		x_dest->stride = x_src->stride; \
+		x_dest->force_key_on_encode = x_src->force_key_on_encode; \
 		x_dest->online = x_src->online; \
 		x_dest->key = x_src->key; \
 		x_dest->gop = x_src->gop; \
@@ -63,6 +65,7 @@ static inline void us_frame_copy_meta(const us_frame_s *src, us_frame_s *dest) {
 		&& x_a->height == x_b->height \
 		&& x_a->format == x_b->format \
 		&& x_a->stride == x_b->stride \
+		&& x_a->force_key_on_encode == x_b->force_key_on_encode \
 		&& x_a->online == x_b->online \
 		&& x_a->key == x_b->key \
 		&& x_a->gop == x_b->gop \

@@ -30,7 +30,7 @@ us_m2m_encoder_s *us_m2m_h264_encoder_init(const char *name, const char *path, u
 	// По логике вещей правильно 0, но почему-то на низких разрешениях типа 640x480
 	// енкодер через несколько секунд перестает производить корректные фреймы.
 	bitrate *= 1000; // From Kbps
-	return _m2m_encoder_init(name, path, V4L2_PIX_FMT_H264, 30, bitrate, gop, 0, true);
+	return _m2m_encoder_init(name, path, V4L2_PIX_FMT_H264, 30, bitrate, gop, 0, false);
 }
 
 us_m2m_encoder_s *us_m2m_mjpeg_encoder_init(const char *name, const char *path, unsigned quality) {

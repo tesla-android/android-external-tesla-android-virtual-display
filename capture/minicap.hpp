@@ -54,6 +54,7 @@ public:
     uint32_t stride;
     uint32_t bpp;
     size_t size;
+    int dma_fd;
   };
 
   struct FrameAvailableListener {
