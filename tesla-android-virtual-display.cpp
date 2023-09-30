@@ -199,7 +199,31 @@ void encode_thread() {
     }
 
     free(input_frame.data);
+  }
+}
 
+void stream_thread_variable_refresh() {
+  MJPEGStreamer streamer;
+  streamer.start(9090, 4);
+
+  us_frame_s last_frame_jpeg;
+  bool has_last_frame = false;
+  int drop_counter = 0;
+  const int drop_limit = 15;   
+
+  while (true) {
+    us_frame_s encoded_frame = encoded_queue.pop();
+    if (has_last_frame &&
+       (us_frame_compare(&last_frame_jpeg, &encoded_frame)) &&
+       drop_counter < drop_limit) {
+         drop_counter++;
+         free(encoded_frame.data);
+         continue;
+    }
+    drop_counter = 0;
+    stream_frame(streamer, encoded_frame);
+    us_frame_copy(&encoded_frame, &last_frame_jpeg);
+    has_last_frame = true;
   }
 }
 
