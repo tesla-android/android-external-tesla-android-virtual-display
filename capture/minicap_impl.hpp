@@ -261,7 +261,7 @@ private:
     printf("Creating virtual display \n");
     mVirtualDisplay = android::SurfaceComposerClient::createDisplay(
       /* const String8& displayName */  android::String8("minicap"),
-      /* bool secure */                 false // can't change to true without a framework patch
+      /* bool secure */                 true
     );
 
     printf("Creating buffer queue \n");
