@@ -350,10 +350,15 @@ int minicap_try_get_display_info(int32_t displayId, Minicap::DisplayInfo* info) 
   android::sp<android::IBinder> dpy = android::SurfaceComposerClient::getPhysicalDisplayToken(*android::PhysicalDisplayId::tryCast(*mDisplayId));
   if(!dpy) {
     printf("could not get display for id: %d, using internal display", displayId);
-    dpy = android::SurfaceComposerClient::getInternalDisplayToken();
-  }  
+        const auto ids = android::SurfaceComposerClient::getPhysicalDisplayIds();
+    if (!ids.empty()) {
+        mDisplayId = ids.front();
+        dpy = android::SurfaceComposerClient::getPhysicalDisplayToken(*android::PhysicalDisplayId::tryCast(*mDisplayId));
+    }
+  }
+
   android::ui::StaticDisplayInfo dinfo;
-  err = android::SurfaceComposerClient::getStaticDisplayInfo(dpy, &dinfo);
+  err = android::SurfaceComposerClient::getStaticDisplayInfo(mDisplayId->value, &dinfo);
   if (err != android::NO_ERROR) {
     printf("SurfaceComposerClient::getStaticDisplayInfo() failed: %s (%d)\n", error_name(err), err);
     return err;
