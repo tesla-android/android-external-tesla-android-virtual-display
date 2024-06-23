@@ -66,6 +66,7 @@ ThreadSafeQueue < us_frame_s > capture_queue;
 us_encoder_set encoders;
 
 int isH264 = 0;
+int encoderQuality = 70;
 
 std::mutex last_encoded_frame_mutex;
 us_frame_s last_encoded_frame;
@@ -89,7 +90,7 @@ void createEncoders() {
     encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 20000, 30);
   } else {
     std::string encoder_name_jpeg = "encoder_jpeg";
-    encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", 90);
+    encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", encoderQuality);
   }
 }
 
@@ -235,6 +236,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   streamer.start(9090, 4);
 
   isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
+  encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
 
   last_encoded_frame.data = nullptr;
 
