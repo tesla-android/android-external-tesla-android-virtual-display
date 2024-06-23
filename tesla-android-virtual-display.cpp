@@ -52,6 +52,8 @@
 
 #include <atomic>
 
+#include <ws.h>
+
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 using namespace android;
@@ -207,6 +209,8 @@ void encode_thread() {
 
         std::string frameData(reinterpret_cast < char * > (encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
         streamer.publish("/stream", frameData);
+	ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
+
         free(encoded_frames.jpeg_frame.data);
       }
     } else {
@@ -231,9 +235,44 @@ void broadcast_thread() {
     }
 }
 
+void ws_on_connection_opened(ws_cli_conn_t *client) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Connection opened, addr: %s\n", cli);
+
+  if (!new_frame_captured.load()) {
+     last_encoded_frame_mutex.lock();
+     if (last_encoded_frame.data != nullptr) {
+         std::string frameData(reinterpret_cast<char*>(last_encoded_frame.data), last_encoded_frame.used);
+         ws_sendframe_bin(NULL, reinterpret_cast<char*>(last_encoded_frame.data), last_encoded_frame.used);
+     }
+     last_encoded_frame_mutex.unlock();
+  }
+  new_frame_captured.store(false);
+}
+
+void ws_on_connection_closed(ws_cli_conn_t *client) {
+  char *cli;
+  cli = ws_getaddress(client);
+  printf("Connection closed, addr: %s\n", cli);
+}
+
+void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
+       __attribute__ ((unused)) const unsigned char *msg,
+       __attribute__ ((unused)) uint64_t size,
+       __attribute__ ((unused)) int type) {
+  ws_ping(NULL, 5);
+}
+
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   minicap_start_thread_pool();
   streamer.start(9090, 4);
+
+  struct ws_events evs;
+  evs.onopen    = &ws_on_connection_opened;
+  evs.onclose   = &ws_on_connection_closed;
+  evs.onmessage = &ws_on_message;
+  ws_socket(&evs, 9091, 1, 1000);
 
   isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
   encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
