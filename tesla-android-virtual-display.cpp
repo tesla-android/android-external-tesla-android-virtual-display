@@ -48,18 +48,11 @@
 
 #include "capture/minicap_impl.hpp"
 
-#include "stream/mjpeg_streamer.hpp"
-
 #include <atomic>
 
 #include <ws.h>
 
-using MJPEGStreamer = nadjieb::MJPEGStreamer;
-
 using namespace android;
-
-// Having more than 1 encoder makes sense only for mjpeg
-const int encoder_pool_size = 1;
 
 static FrameWaiter frameWaiter;
 
@@ -67,15 +60,7 @@ ThreadSafeQueue < us_frame_s > capture_queue;
 
 us_encoder_set encoders;
 
-int isH264 = 0;
 int encoderQuality = 70;
-
-std::mutex last_encoded_frame_mutex;
-us_frame_s last_encoded_frame;
-
-std::atomic<bool> new_frame_captured(false);
-
-MJPEGStreamer streamer;
 
 int get_system_property_int(const char * prop_name) {
   char prop_value[PROPERTY_VALUE_MAX];
@@ -87,13 +72,8 @@ int get_system_property_int(const char * prop_name) {
 }
 
 void createEncoders() {
-  if (isH264) {
-    std::string encoder_name_h264 = "encoder_h264";
-    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 20000, 30);
-  } else {
-    std::string encoder_name_jpeg = "encoder_jpeg";
-    encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", encoderQuality);
-  }
+	std::string encoder_name_h264 = "encoder_h264";
+	encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 20000, 30);
 }
 
 void capture_thread() {
@@ -155,7 +135,6 @@ void capture_thread() {
     encoderFrame.force_key_on_encode = false;
     encoderFrame.dma_fd = capturedFrame.dma_fd;
 
-    new_frame_captured.store(true);
     capture_queue.push(encoderFrame);
 
     minicap -> releaseConsumedFrame( & capturedFrame);
@@ -183,36 +162,12 @@ void encode_thread() {
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
     us_frame_s encoded_frame_h264;
-    us_frame_s encoded_frame_jpeg;
-    us_encoded_frame_set encoded_frames;
 
-    if (isH264) {
-      encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
-      encoded_frames.h264_frame = encoded_frame_h264;
-    } else {
-      encode_frame(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg, V4L2_PIX_FMT_JPEG);
-      encoded_frames.jpeg_frame = encoded_frame_jpeg;
-    }
+    encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
 
-    if (encoded_frame_jpeg.data != nullptr || encoded_frame_h264.data != nullptr) {
-      if (isH264) {
-        free(encoded_frames.h264_frame.data);
-      } else {
-        last_encoded_frame_mutex.lock();
-        if (last_encoded_frame.data != nullptr) {
-        	free(last_encoded_frame.data);
-        }
-        last_encoded_frame = encoded_frames.jpeg_frame;
-        last_encoded_frame.data = static_cast < uint8_t * > (malloc(encoded_frames.jpeg_frame.used));
-        memcpy(last_encoded_frame.data, encoded_frames.jpeg_frame.data, last_encoded_frame.used);
-        last_encoded_frame_mutex.unlock();
-
-        std::string frameData(reinterpret_cast < char * > (encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
-        streamer.publish("/stream", frameData);
-	ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frames.jpeg_frame.data), encoded_frames.jpeg_frame.used);
-
-        free(encoded_frames.jpeg_frame.data);
-      }
+    if (encoded_frame_h264.data != nullptr) {
+		ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frame_h264.data), encoded_frame_h264.used);
+    	free(encoded_frame_h264.data);
     } else {
       std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
     }
@@ -220,35 +175,10 @@ void encode_thread() {
   }
 }
 
-void broadcast_thread() {
-  while (true) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (!new_frame_captured.load()) {
-        last_encoded_frame_mutex.lock();
-        if (last_encoded_frame.data != nullptr) {
-            std::string frameData(reinterpret_cast<char*>(last_encoded_frame.data), last_encoded_frame.used);
-            streamer.publish("/stream", frameData);
-        }
-        last_encoded_frame_mutex.unlock();
-    }
-    new_frame_captured.store(false);
-    }
-}
-
 void ws_on_connection_opened(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection opened, addr: %s\n", cli);
-
-  if (!new_frame_captured.load()) {
-     last_encoded_frame_mutex.lock();
-     if (last_encoded_frame.data != nullptr) {
-         std::string frameData(reinterpret_cast<char*>(last_encoded_frame.data), last_encoded_frame.used);
-         ws_sendframe_bin(NULL, reinterpret_cast<char*>(last_encoded_frame.data), last_encoded_frame.used);
-     }
-     last_encoded_frame_mutex.unlock();
-  }
-  new_frame_captured.store(false);
 }
 
 void ws_on_connection_closed(ws_cli_conn_t *client) {
@@ -266,7 +196,6 @@ void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   minicap_start_thread_pool();
-  streamer.start(9090, 4);
 
   struct ws_events evs;
   evs.onopen    = &ws_on_connection_opened;
@@ -274,20 +203,15 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   evs.onmessage = &ws_on_message;
   ws_socket(&evs, 9091, 1, 1000);
 
-  isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
   encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
-
-  last_encoded_frame.data = nullptr;
 
   createEncoders();
 
   std::thread captureT(capture_thread);
   std::thread encodeT(encode_thread);
-  std::thread broadcastT(broadcast_thread);
 
   captureT.join();
   encodeT.join();
-  broadcastT.join();
 
   return 0;
 }
