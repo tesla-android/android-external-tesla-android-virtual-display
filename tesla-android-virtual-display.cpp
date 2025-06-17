@@ -134,7 +134,6 @@ void capture_thread() {
     encoderFrame.used = capturedFrame.size;
     encoderFrame.force_key_on_encode = false;
     encoderFrame.dma_fd = capturedFrame.dma_fd;
-
     capture_queue.push(encoderFrame);
 
     minicap -> releaseConsumedFrame( & capturedFrame);
@@ -175,10 +174,54 @@ void encode_thread() {
   }
 }
 
+void trigger_virtual_display_refresh() {
+  const char* binaryPath = "/system/bin/wm";
+
+  std::ostringstream defaultDensityStream, overrideDensityStream;
+
+  int density = get_system_property_int("persist.tesla-android.virtual-display.density");
+  int overrideDensity = density++;
+
+  defaultDensityStream << density;
+  overrideDensityStream << overrideDensity;
+
+  std::string defaultDensityStr = defaultDensityStream.str();
+  std::string overrideDensityStr = overrideDensityStream.str();
+
+  const char* defaultDensityCStr = defaultDensityStr.c_str();
+  const char* overrideDensityCStr = overrideDensityStr.c_str();
+
+  pid_t pid = fork();
+  int status;
+  if (pid == -1) {
+    perror("fork failed");
+    exit(-1);
+  } else if (pid == 0) {
+    execlp(binaryPath, binaryPath, "density", overrideDensityCStr, NULL);
+    perror("execlp failed");
+    exit(-1);
+  }
+  wait(&status);
+  printf("child exit status: %d\n", WEXITSTATUS(status));
+
+  pid = fork();
+  if (pid == -1) {
+    perror("fork failed");
+    exit(-1);
+  } else if (pid == 0) {
+    execlp(binaryPath, binaryPath, "density", defaultDensityCStr, NULL);
+    perror("execlp failed");
+    exit(-1);
+  }
+  wait(&status);
+  printf("child exit status: %d\n", WEXITSTATUS(status));
+}
+
 void ws_on_connection_opened(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection opened, addr: %s\n", cli);
+  trigger_virtual_display_refresh();
 }
 
 void ws_on_connection_closed(ws_cli_conn_t *client) {
