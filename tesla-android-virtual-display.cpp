@@ -46,11 +46,15 @@
 
 #include "capture/frame_waiter.h"
 
+#include "stream/mjpeg_streamer.hpp"
+
 #include "capture/minicap_impl.hpp"
 
 #include <atomic>
 
 #include <ws.h>
+
+using MJPEGStreamer = nadjieb::MJPEGStreamer;
 
 using namespace android;
 
@@ -60,7 +64,10 @@ ThreadSafeQueue < us_frame_s > capture_queue;
 
 us_encoder_set encoders;
 
+int isH264 = 0;
 int encoderQuality = 70;
+
+MJPEGStreamer streamer;
 
 int get_system_property_int(const char * prop_name) {
   char prop_value[PROPERTY_VALUE_MAX];
@@ -72,8 +79,13 @@ int get_system_property_int(const char * prop_name) {
 }
 
 void createEncoders() {
-	std::string encoder_name_h264 = "encoder_h264";
-	encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 20000, 30);
+  if (isH264) {
+    std::string encoder_name_h264 = "encoder_h264";
+    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 28000 * (encoderQuality / 100), 30);
+  } else {
+    std::string encoder_name_jpeg = "encoder_jpeg";
+    encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", encoderQuality);
+  }
 }
 
 void capture_thread() {
@@ -160,15 +172,28 @@ void encode_frame(us_m2m_encoder_s * encoder,
 void encode_thread() {
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
-    us_frame_s encoded_frame_h264;
 
-    encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
+    if (isH264) {
+      us_frame_s encoded_frame_h264;
+      encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
 
-    if (encoded_frame_h264.data != nullptr) {
+      if (encoded_frame_h264.data != nullptr) {
 		ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frame_h264.data), encoded_frame_h264.used);
     	free(encoded_frame_h264.data);
+      } else {
+        std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
+      }
     } else {
-      std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
+      us_frame_s encoded_frame_jpeg;
+      encode_frame(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg, V4L2_PIX_FMT_JPEG);
+      if (encoded_frame_jpeg.data != nullptr) {
+        std::string frameData(reinterpret_cast < char * > (encoded_frame_jpeg.data), encoded_frame_jpeg.used);
+        streamer.publish("/stream", frameData);
+		ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frame_jpeg.data), encoded_frame_jpeg.used);
+		free(encoded_frame_jpeg.data);
+      } else {
+        std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
+      }
     }
     free(input_frame.data);
   }
@@ -246,6 +271,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   evs.onmessage = &ws_on_message;
   ws_socket(&evs, 9091, 1, 1000);
 
+  isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
   encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
 
   createEncoders();
