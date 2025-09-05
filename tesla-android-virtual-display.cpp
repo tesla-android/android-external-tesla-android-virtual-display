@@ -216,6 +216,8 @@ void trigger_virtual_display_refresh() {
   const char* defaultDensityCStr = defaultDensityStr.c_str();
   const char* overrideDensityCStr = overrideDensityStr.c_str();
 
+  sleep(1);
+
   pid_t pid = fork();
   int status;
   if (pid == -1) {
@@ -228,6 +230,8 @@ void trigger_virtual_display_refresh() {
   }
   wait(&status);
   printf("child exit status: %d\n", WEXITSTATUS(status));
+
+  sleep(1);
 
   pid = fork();
   if (pid == -1) {
