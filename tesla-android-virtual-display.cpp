@@ -81,7 +81,7 @@ int get_system_property_int(const char * prop_name) {
 void createEncoders() {
   if (isH264) {
     std::string encoder_name_h264 = "encoder_h264";
-    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 28000 * (encoderQuality / 100), 30);
+    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 32000 * (encoderQuality / 100), 30);
   } else {
     std::string encoder_name_jpeg = "encoder_jpeg";
     encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", encoderQuality);
