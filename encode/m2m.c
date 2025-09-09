@@ -24,6 +24,30 @@ static int _m2m_encoder_compress_raw(us_m2m_encoder_s *enc, const us_frame_s *sr
 
 #define _RUN(x_next) enc->run->x_next
 
+int us_m2m_encoder_request_keyframe(us_m2m_encoder_s *enc) {
+	if (!enc || !enc->run) return -EINVAL;
+
+	if (!_RUN(ready) || _RUN(fd) < 0) {
+		_RUN(force_key_pending) = 1;
+		return 0;
+	}
+
+	struct v4l2_control ctl = {0};
+	ctl.id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
+	ctl.value = 1;
+
+	if (ioctl(_RUN(fd), VIDIOC_S_CTRL, &ctl) == 0) {
+		_RUN(force_key_pending) = 0;
+		return 0;
+	}
+
+	if (errno == EBUSY || errno == EINVAL) {
+		_RUN(force_key_pending) = 1;
+		return 0;
+	}
+	_RUN(force_key_pending) = 1;
+	return -errno;
+}
 
 us_m2m_encoder_s *us_m2m_h264_encoder_init(const char *name, const char *path, unsigned bitrate, unsigned gop) {
 	// FIXME: 30 or 0? https://github.com/6by9/yavta/blob/master/yavta.c#L2100
@@ -74,7 +98,16 @@ int us_m2m_encoder_compress(us_m2m_encoder_s *enc, const us_frame_s *src, us_fra
 		return -1;
 	}
 
-	force_key = (enc->output_format == V4L2_PIX_FMT_H264 && (force_key || _RUN(last_online) != src->online));
+#if defined(__GNUC__)
+	int pending = __atomic_exchange_n(&_RUN(force_key_pending), 0, __ATOMIC_ACQ_REL);
+#else
+	int pending = _RUN(force_key_pending);
+	_RUN(force_key_pending) = 0;
+#endif
+
+	force_key = (enc->output_format == V4L2_PIX_FMT_H264) &&
+	            (force_key || pending || _RUN(last_online) != src->online);
+
 
 	if (_m2m_encoder_compress_raw(enc, src, dest, force_key) < 0) {
 		_m2m_encoder_cleanup(enc);
@@ -99,6 +132,7 @@ static us_m2m_encoder_s *_m2m_encoder_init(
 
 	us_m2m_encoder_runtime_s *run = calloc(1, sizeof(us_m2m_encoder_runtime_s));
 
+	run->force_key_pending = 0;
 	run->last_online = -1;
 	run->fd = -1;
 
@@ -128,6 +162,8 @@ static us_m2m_encoder_s *_m2m_encoder_init(
 
 static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame) {
 	const bool dma = (enc->allow_dma && frame->dma_fd >= 0);
+
+	_RUN(force_key_pending) = 0;
 
 	_E_LOG_INFO("Configuring encoder: DMA=%d ...", dma);
 
@@ -354,6 +390,7 @@ static void _m2m_encoder_cleanup(us_m2m_encoder_s *enc) {
 	}
 
 	_RUN(last_online) = -1;
+	_RUN(force_key_pending) = 0;
 	_RUN(ready) = false;
 
 	_E_LOG_DEBUG("Encoder state: ~~~ NOT READY ~~~");
@@ -368,8 +405,12 @@ static int _m2m_encoder_compress_raw(us_m2m_encoder_s *enc, const us_frame_s *sr
 		struct v4l2_control ctl = {0};
 		ctl.id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
 		ctl.value = 1;
-		_E_LOG_DEBUG("Forcing keyframe ...")
-		_E_XIOCTL(VIDIOC_S_CTRL, &ctl, "Can't force keyframe");
+		_E_LOG_DEBUG("Forcing keyframe ...");
+		/* be forgiving with transient EBUSY */
+		if (ioctl(_RUN(fd), VIDIOC_S_CTRL, &ctl) < 0 && errno != EBUSY) {
+			_E_LOG_PERROR("Can't force keyframe");
+			goto error;
+		}
 	}
 
 	struct v4l2_buffer input_buf = {0};
