@@ -1,70 +1,55 @@
 #include <errno.h>
 
 #include <unistd.h>
-
 #include <stdio.h>
-
 #include <fcntl.h>
-
 #include <stdlib.h>
-
 #include <string.h>
 
 #include <linux/fb.h>
-
 #include <sys/ioctl.h>
-
 #include <sys/mman.h>
-
 #include <sys/wait.h>
 
 #include <android/bitmap.h>
 
 #include <binder/ProcessState.h>
 
-#include <gui/ISurfaceComposer.h>
-
+#include <gui/ISurfaceComposer.h>            // ScreenshotClient
 #include <gui/SurfaceComposerClient.h>
-
 #include <gui/SyncScreenCaptureListener.h>
 
 #include <ui/GraphicTypes.h>
-
 #include <ui/PixelFormat.h>
-
+#include <ui/DisplayId.h>
 #include <system/graphics.h>
 
 #include <chrono>
-
 #include <thread>
+#include <atomic>
+#include <sstream>
+#include <iostream>
+#include <optional>
+#include <vector>
 
 #include "encode/m2m.h"
-
 #include "utils/thread_safe_queue.h"
-
 #include <cutils/properties.h>
-
 #include "capture/frame_waiter.h"
-
 #include "stream/mjpeg_streamer.hpp"
-
 #include "capture/minicap_impl.hpp"
-
-#include <atomic>
-
 #include <ws.h>
 
 using MJPEGStreamer = nadjieb::MJPEGStreamer;
-
 using namespace android;
 
 static FrameWaiter frameWaiter;
 
-ThreadSafeQueue < us_frame_s > capture_queue;
+ThreadSafeQueue<us_frame_s> capture_queue;
 
 us_encoder_set encoders;
 
-int isH264 = 0;
+int isH264 = 1;
 int encoderQuality = 70;
 
 MJPEGStreamer streamer;
@@ -86,6 +71,97 @@ void createEncoders() {
     std::string encoder_name_jpeg = "encoder_jpeg";
     encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", encoderQuality);
   }
+}
+
+/**
+ * Minimal screencap-like helper for your headers:
+ * - 2-arg ScreenshotClient::captureDisplay(displayId, listener)
+ * - ScreenCaptureResults has .buffer only (no fences/results)
+ */
+static status_t capture_one_simple(const android::DisplayId displayId,
+                                   android::ScreenCaptureResults& outResult)
+{
+  sp<SyncScreenCaptureListener> listener = new SyncScreenCaptureListener();
+
+  status_t st = ScreenshotClient::captureDisplay(displayId, listener);
+  if (st != NO_ERROR) {
+    fprintf(stderr, "capture_one_simple(): captureDisplay failed: %d\n", st);
+    return st;
+  }
+
+  ScreenCaptureResults results = listener->waitForResults();
+  if (results.buffer == nullptr) {
+    fprintf(stderr, "capture_one_simple(): null buffer\n");
+    return UNKNOWN_ERROR;
+  }
+
+  outResult = results;
+  return NO_ERROR;
+}
+
+/**
+ * Capture ONE screenshot (no display config changes), and push it **as DMABUF**
+ * to avoid switching the encoder away from DMA.
+ * We DUP the buffer FD so its lifetime is independent of the GraphicBuffer.
+ */
+static bool push_one_screenshot_frame_dma()
+{
+  // Choose a physical display (first available)
+  const auto ids = SurfaceComposerClient::getPhysicalDisplayIds();
+  if (ids.empty()) {
+    fprintf(stderr, "push_one_screenshot_frame_dma(): no physical displays\n");
+    return false;
+  }
+  const DisplayId displayId = ids.front(); // implicit to DisplayId in your tree
+
+  ScreenCaptureResults results;
+  status_t st = capture_one_simple(displayId, results);
+  if (st != NO_ERROR || results.buffer == nullptr) {
+    fprintf(stderr, "push_one_screenshot_frame_dma(): capture failed (%d)\n", st);
+    return false;
+  }
+
+  sp<GraphicBuffer> gb = results.buffer;
+
+  // Get a DMABUF FD from the native handle (same pattern you use in minicap)
+  ANativeWindowBuffer* anb = gb->getNativeBuffer();
+  if (!anb || !anb->handle) {
+    fprintf(stderr, "push_one_screenshot_frame_dma(): invalid native buffer/handle\n");
+    return false;
+  }
+
+  // Most grallocs expose the prime fd in handle->data[0]
+  const int src_fd = anb->handle->data[0];
+  if (src_fd < 0) {
+    fprintf(stderr, "push_one_screenshot_frame_dma(): no valid dmabuf fd in handle->data[0]\n");
+    return false;
+  }
+
+  // DUP so V4L2 can safely use it after this function returns
+  const int dup_fd = dup(src_fd);
+  if (dup_fd < 0) {
+    perror("dup(dmabuf)");
+    return false;
+  }
+
+  const int width  = gb->getWidth();
+  const int height = gb->getHeight();
+  const int bpp    = android::bytesPerPixel(gb->getPixelFormat()); // usually 4
+  const size_t bytes = (size_t)width * (size_t)height * (size_t)std::max(1, bpp);
+
+  // Enqueue as DMA (data=NULL); keep your existing V4L2_FMT (BGR32) so encoder doesn't re-prepare
+  us_frame_s encoderFrame;
+  encoderFrame.width  = width;
+  encoderFrame.height = height;
+  encoderFrame.format = V4L2_PIX_FMT_BGR32; // matches your current pipeline
+  encoderFrame.stride = 0;                   // unused for DMA
+  encoderFrame.used   = bytes;               // consumed as bytesused for DMABUF
+  encoderFrame.force_key_on_encode = true;   // ensure IDR
+  encoderFrame.data   = NULL;                // NULL for DMA path
+  encoderFrame.dma_fd = dup_fd;              // our own ref-counted fd
+
+  capture_queue.push(encoderFrame);
+  return true;
 }
 
 void capture_thread() {
@@ -167,6 +243,12 @@ void encode_frame(us_m2m_encoder_s * encoder,
   if (compression_result != 0) {
     fprintf(stderr, "Failed to compress frame (error code: %d)\n", compression_result);
   }
+
+  // Close duplicated DMABUF fd if we created one for the screenshot frame
+  if (input_frame.dma_fd >= 0 && input_frame.data == NULL && input_frame.force_key_on_encode) {
+    // This heuristically matches our "screenshot-as-DMA" frame
+    close(input_frame.dma_fd);
+  }
 }
 
 void encode_thread() {
@@ -178,8 +260,8 @@ void encode_thread() {
       encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
 
       if (encoded_frame_h264.data != nullptr) {
-		ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frame_h264.data), encoded_frame_h264.used);
-    	free(encoded_frame_h264.data);
+        ws_sendframe_bin(NULL, reinterpret_cast<char*>(encoded_frame_h264.data), encoded_frame_h264.used);
+        free(encoded_frame_h264.data);
       } else {
         std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
       }
@@ -187,70 +269,39 @@ void encode_thread() {
       us_frame_s encoded_frame_jpeg;
       encode_frame(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg, V4L2_PIX_FMT_JPEG);
       if (encoded_frame_jpeg.data != nullptr) {
-        std::string frameData(reinterpret_cast < char * > (encoded_frame_jpeg.data), encoded_frame_jpeg.used);
+        std::string frameData(reinterpret_cast<char*>(encoded_frame_jpeg.data), encoded_frame_jpeg.used);
         streamer.publish("/stream", frameData);
-		ws_sendframe_bin(NULL, reinterpret_cast < char * > (encoded_frame_jpeg.data), encoded_frame_jpeg.used);
-		free(encoded_frame_jpeg.data);
+        ws_sendframe_bin(NULL, reinterpret_cast<char*>(encoded_frame_jpeg.data), encoded_frame_jpeg.used);
+        free(encoded_frame_jpeg.data);
       } else {
         std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
       }
     }
-    free(input_frame.data);
+
+    // Free CPU buffers from normal (non-DMA) capture path (if any)
+    if (input_frame.data) {
+      free(input_frame.data);
+    }
   }
-}
-
-void trigger_virtual_display_refresh() {
-  const char* binaryPath = "/system/bin/wm";
-
-  std::ostringstream defaultDensityStream, overrideDensityStream;
-
-  int density = get_system_property_int("persist.tesla-android.virtual-display.density");
-  int overrideDensity = density++;
-
-  defaultDensityStream << density;
-  overrideDensityStream << overrideDensity;
-
-  std::string defaultDensityStr = defaultDensityStream.str();
-  std::string overrideDensityStr = overrideDensityStream.str();
-
-  const char* defaultDensityCStr = defaultDensityStr.c_str();
-  const char* overrideDensityCStr = overrideDensityStr.c_str();
-
-  sleep(1);
-
-  pid_t pid = fork();
-  int status;
-  if (pid == -1) {
-    perror("fork failed");
-    exit(-1);
-  } else if (pid == 0) {
-    execlp(binaryPath, binaryPath, "density", overrideDensityCStr, NULL);
-    perror("execlp failed");
-    exit(-1);
-  }
-  wait(&status);
-  printf("child exit status: %d\n", WEXITSTATUS(status));
-
-  sleep(1);
-
-  pid = fork();
-  if (pid == -1) {
-    perror("fork failed");
-    exit(-1);
-  } else if (pid == 0) {
-    execlp(binaryPath, binaryPath, "density", defaultDensityCStr, NULL);
-    perror("execlp failed");
-    exit(-1);
-  }
-  wait(&status);
-  printf("child exit status: %d\n", WEXITSTATUS(status));
 }
 
 void ws_on_connection_opened(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection opened, addr: %s\n", cli);
-  trigger_virtual_display_refresh();
+
+  // Capture ONE screenshot as **DMABUF** so the encoder stays in DMA mode.
+  if (!push_one_screenshot_frame_dma()) {
+    fprintf(stderr, "Warning: screenshot-on-connect failed; will wait for next minicap frame.\n");
+  }
+
+  // Force an IDR from the encoder ASAP (if H264) so the first encoded frame after connect is a keyframe.
+  if (isH264 && encoders.h264_encoder) {
+    int rc = us_m2m_encoder_request_keyframe(encoders.h264_encoder);
+    if (rc < 0) {
+      fprintf(stderr, "request_keyframe failed: %d\n", rc);
+    }
+  }
 }
 
 void ws_on_connection_closed(ws_cli_conn_t *client) {
@@ -275,7 +326,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   evs.onmessage = &ws_on_message;
   ws_socket(&evs, 9091, 1, 1000);
 
-  isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
+  //isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
   encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
 
   createEncoders();
