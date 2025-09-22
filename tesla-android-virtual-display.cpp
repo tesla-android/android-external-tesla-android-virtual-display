@@ -49,7 +49,7 @@ ThreadSafeQueue<us_frame_s> capture_queue;
 
 us_encoder_set encoders;
 
-int isH264 = 1;
+int isH264 = 0;
 int encoderQuality = 70;
 
 MJPEGStreamer streamer;
@@ -313,9 +313,7 @@ void ws_on_connection_closed(ws_cli_conn_t *client) {
 void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
        __attribute__ ((unused)) const unsigned char *msg,
        __attribute__ ((unused)) uint64_t size,
-       __attribute__ ((unused)) int type) {
-  ws_ping(NULL, 5);
-}
+       __attribute__ ((unused)) int type) {}
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   minicap_start_thread_pool();
@@ -326,7 +324,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   evs.onmessage = &ws_on_message;
   ws_socket(&evs, 9091, 1, 1000);
 
-  //isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
+  isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
   encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
 
   createEncoders();
