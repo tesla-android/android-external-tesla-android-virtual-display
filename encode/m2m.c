@@ -15,6 +15,9 @@ static void _m2m_encoder_cleanup(us_m2m_encoder_s *enc);
 
 static int _m2m_encoder_compress_raw(us_m2m_encoder_s *enc, const us_frame_s *src, us_frame_s *dest, bool force_key);
 
+static int _m2m_encoder_set_ctrl(
+	us_m2m_encoder_s *enc, uint32_t cid, int value, bool optional, const char *cid_name);
+
 
 #define _E_LOG_ERROR(x_msg, ...)	US_LOG_ERROR("%s: " x_msg, enc->name, ##__VA_ARGS__)
 #define _E_LOG_PERROR(x_msg, ...)	US_LOG_PERROR("%s: " x_msg, enc->name, ##__VA_ARGS__)
@@ -23,6 +26,19 @@ static int _m2m_encoder_compress_raw(us_m2m_encoder_s *enc, const us_frame_s *sr
 #define _E_LOG_DEBUG(x_msg, ...)	US_LOG_DEBUG("%s: " x_msg, enc->name, ##__VA_ARGS__)
 
 #define _RUN(x_next) enc->run->x_next
+
+static bool _g_m2m_diagnostics_enabled = false;
+
+void us_m2m_encoder_set_diagnostics(bool enabled) {
+	_g_m2m_diagnostics_enabled = enabled;
+}
+
+static void _m2m_encoder_diag_report_ctrl_support(us_m2m_encoder_s *enc, uint32_t cid, const char *cid_name);
+static void _m2m_encoder_diag_report_ctrl_value(us_m2m_encoder_s *enc, uint32_t cid, const char *cid_name);
+static void _m2m_encoder_diag_report_format(
+	us_m2m_encoder_s *enc, const char *stream_name, const struct v4l2_format *fmt);
+static void _m2m_encoder_diag_report_recommended_v4l2ctl(us_m2m_encoder_s *enc);
+static void _m2m_encoder_diag_report_controls(us_m2m_encoder_s *enc);
 
 int us_m2m_encoder_request_keyframe(us_m2m_encoder_s *enc) {
 	if (!enc || !enc->run) return -EINVAL;
@@ -89,7 +105,7 @@ int us_m2m_encoder_compress(us_m2m_encoder_s *enc, const us_frame_s *src, us_fra
 		_RUN(width) != src->width
 		|| _RUN(height) != src->height
 		|| _RUN(input_format) != src->format
-//		|| _RUN(stride) != src->stride
+		|| _RUN(stride) != src->stride
 		|| _RUN(dma) != (enc->allow_dma && src->dma_fd >= 0)
 	) {
 		_m2m_encoder_prepare(enc, src);
@@ -160,6 +176,32 @@ static us_m2m_encoder_s *_m2m_encoder_init(
 		} \
 	}
 
+static int _m2m_encoder_set_ctrl(
+	us_m2m_encoder_s *enc, uint32_t cid, int value, bool optional, const char *cid_name) {
+	struct v4l2_control ctl = {0};
+	ctl.id = cid;
+	ctl.value = value;
+	_E_LOG_DEBUG("Configuring option %s=%d ...", cid_name, value);
+
+	if (us_xioctl(_RUN(fd), VIDIOC_S_CTRL, &ctl) == 0) {
+		_m2m_encoder_diag_report_ctrl_value(enc, cid, cid_name);
+		return 1;
+	}
+
+	if (optional && (
+		errno == EINVAL
+		|| errno == ENOTTY
+		|| errno == EOPNOTSUPP
+		|| errno == ERANGE
+	)) {
+		_E_LOG_INFO("Skipping unsupported option %s=%d", cid_name, value);
+		return 0;
+	}
+
+	_E_LOG_PERROR("Can't set option %s", cid_name);
+	return -1;
+}
+
 static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame) {
 	const bool dma = (enc->allow_dma && frame->dma_fd >= 0);
 
@@ -172,7 +214,7 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 	_RUN(width) = frame->width;
 	_RUN(height) = frame->height;
 	_RUN(input_format) = frame->format;
-//	_RUN(stride) = frame->stride;
+	_RUN(stride) = frame->stride;
 	_RUN(dma) = dma;
 
 	if ((_RUN(fd) = open(enc->path, O_RDWR)) < 0) {
@@ -180,34 +222,88 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 		goto error;
 	}
 	_E_LOG_DEBUG("Encoder device fd=%d opened", _RUN(fd));
+	_m2m_encoder_diag_report_recommended_v4l2ctl(enc);
+	_m2m_encoder_diag_report_controls(enc);
 
-#	define SET_OPTION(x_cid, x_value) { \
-			struct v4l2_control m_ctl = {0}; \
-			m_ctl.id = x_cid; \
-			m_ctl.value = x_value; \
-			_E_LOG_DEBUG("Configuring option " #x_cid " ..."); \
-			_E_XIOCTL(VIDIOC_S_CTRL, &m_ctl, "Can't set option " #x_cid); \
+#	define SET_OPTION_REQUIRED(x_cid, x_value) { \
+			if (_m2m_encoder_set_ctrl(enc, x_cid, x_value, false, #x_cid) < 0) { \
+				goto error; \
+			} \
+		}
+#	define SET_OPTION_OPTIONAL(x_cid, x_value) { \
+			if (_m2m_encoder_set_ctrl(enc, x_cid, x_value, true, #x_cid) < 0) { \
+				goto error; \
+			} \
 		}
 
 	if (enc->output_format == V4L2_PIX_FMT_H264) {
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_BITRATE,				enc->bitrate);
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD,		enc->gop);
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_H264_PROFILE,		V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE);
-		if (_RUN(width) * _RUN(height) <= 1920 * 1080) { // https://forums.raspberrypi.com/viewtopic.php?t=291447#p1762296
-			SET_OPTION(V4L2_CID_MPEG_VIDEO_H264_LEVEL,		V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
-		} else {
-			SET_OPTION(V4L2_CID_MPEG_VIDEO_H264_LEVEL,		V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
+		int high_profile_set = 0;
+		int level_set = 0;
+
+		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_BITRATE, enc->bitrate);
+#if defined(V4L2_CID_MPEG_VIDEO_BITRATE_MODE) && defined(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
+		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+#endif
+		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, enc->gop);
+#if defined(V4L2_CID_MPEG_VIDEO_H264_PROFILE) && defined(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)
+		{
+			int status = _m2m_encoder_set_ctrl(
+				enc,
+				V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+				V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
+				true,
+				"V4L2_CID_MPEG_VIDEO_H264_PROFILE(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)"
+			);
+			if (status < 0) {
+				goto error;
+			}
+			high_profile_set = (status > 0);
 		}
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER,	1);
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_H264_MIN_QP,			16);
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_H264_MAX_QP,			32);
+#endif
+		if (!high_profile_set) {
+			SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_PROFILE, V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE);
+		}
+#if defined(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE) && defined(V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC)
+		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC);
+#endif
+		if (_RUN(width) * _RUN(height) <= 1920 * 1080) { // https://forums.raspberrypi.com/viewtopic.php?t=291447#p1762296
+			SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
+			level_set = 1;
+		} else {
+#if defined(V4L2_MPEG_VIDEO_H264_LEVEL_4_2)
+			{
+				int status = _m2m_encoder_set_ctrl(
+					enc,
+					V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+					V4L2_MPEG_VIDEO_H264_LEVEL_4_2,
+					true,
+					"V4L2_CID_MPEG_VIDEO_H264_LEVEL(V4L2_MPEG_VIDEO_H264_LEVEL_4_2)"
+				);
+				if (status < 0) {
+					goto error;
+				}
+				level_set = (status > 0);
+			}
+#endif
+			if (!level_set) {
+				SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
+			}
+		}
+		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, 1);
+#if defined(V4L2_CID_MPEG_VIDEO_H264_MIN_QP)
+		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 12);
+#endif
+#if defined(V4L2_CID_MPEG_VIDEO_H264_MAX_QP)
+		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 36);
+#endif
 	} else if (enc->output_format == V4L2_PIX_FMT_MJPEG) {
-		SET_OPTION(V4L2_CID_MPEG_VIDEO_BITRATE,				enc->bitrate);
+		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_BITRATE, enc->bitrate);
 	} else if (enc->output_format == V4L2_PIX_FMT_JPEG) {
-		SET_OPTION(V4L2_CID_JPEG_COMPRESSION_QUALITY,		enc->quality);
+		SET_OPTION_REQUIRED(V4L2_CID_JPEG_COMPRESSION_QUALITY, enc->quality);
 	}
 
-#	undef SET_OPTION
+#	undef SET_OPTION_REQUIRED
+#	undef SET_OPTION_OPTIONAL
 
 	{
 		struct v4l2_format fmt = {0};
@@ -216,11 +312,18 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 		fmt.fmt.pix_mp.height = _RUN(height);
 		fmt.fmt.pix_mp.pixelformat = _RUN(input_format);
 		fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
-		fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG; // libcamera currently has no means to request the right colour space
+#ifdef V4L2_COLORSPACE_SRGB
+		fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_SRGB;
+#else
+		fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG; // fallback for older headers
+#endif
 		fmt.fmt.pix_mp.num_planes = 1;
-		// fmt.fmt.pix_mp.plane_fmt[0].bytesperline = _RUN(stride);
+		if (_RUN(stride) > 0) {
+			fmt.fmt.pix_mp.plane_fmt[0].bytesperline = _RUN(stride);
+		}
 		_E_LOG_DEBUG("Configuring INPUT format ...");
 		_E_XIOCTL(VIDIOC_S_FMT, &fmt, "Can't set INPUT format");
+		_m2m_encoder_diag_report_format(enc, "INPUT", &fmt);
 	}
 
 	{
@@ -236,10 +339,19 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 		if (enc->output_format == V4L2_PIX_FMT_H264) {
 			// https://github.com/pikvm/ustreamer/issues/169
 			// https://github.com/raspberrypi/linux/pull/5232
-			fmt.fmt.pix_mp.plane_fmt[0].sizeimage = (1024 + 512) << 10; // 1.5Mb
+			const uint64_t min_sizeimage = (uint64_t)((1024 + 512) << 10); // 1.5 MiB
+			uint64_t dynamic_sizeimage = ((uint64_t)_RUN(width) * _RUN(height) * 3) / 2;
+			if (dynamic_sizeimage < min_sizeimage) {
+				dynamic_sizeimage = min_sizeimage;
+			}
+			if (dynamic_sizeimage > UINT32_MAX) {
+				dynamic_sizeimage = UINT32_MAX;
+			}
+			fmt.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)dynamic_sizeimage;
 		}
 		_E_LOG_DEBUG("Configuring OUTPUT format ...");
 		_E_XIOCTL(VIDIOC_S_FMT, &fmt, "Can't set OUTPUT format");
+		_m2m_encoder_diag_report_format(enc, "OUTPUT", &fmt);
 		if (fmt.fmt.pix_mp.pixelformat != enc->output_format) {
 			char fourcc_str[8];
 			_E_LOG_ERROR("The OUTPUT format can't be configured as %s",
@@ -284,6 +396,112 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 	error:
 		_m2m_encoder_cleanup(enc);
 		_E_LOG_ERROR("Encoder destroyed due an error (prepare)");
+}
+
+static void _m2m_encoder_diag_report_ctrl_support(us_m2m_encoder_s *enc, uint32_t cid, const char *cid_name) {
+	if (!_g_m2m_diagnostics_enabled || _RUN(fd) < 0) {
+		return;
+	}
+
+	struct v4l2_queryctrl query = {0};
+	query.id = cid;
+	if (ioctl(_RUN(fd), VIDIOC_QUERYCTRL, &query) == 0) {
+		_E_LOG_INFO(
+			"Diag control support: %s (%#x) min=%d max=%d step=%d default=%d flags=%#x",
+			cid_name,
+			cid,
+			query.minimum,
+			query.maximum,
+			query.step,
+			query.default_value,
+			query.flags
+		);
+		return;
+	}
+
+	if (errno == EINVAL) {
+		_E_LOG_INFO("Diag control support: %s (%#x) not supported", cid_name, cid);
+		return;
+	}
+
+	_E_LOG_PERROR("Diag control support query failed for %s", cid_name);
+}
+
+static void _m2m_encoder_diag_report_ctrl_value(us_m2m_encoder_s *enc, uint32_t cid, const char *cid_name) {
+	if (!_g_m2m_diagnostics_enabled || _RUN(fd) < 0) {
+		return;
+	}
+
+	struct v4l2_control ctrl = {0};
+	ctrl.id = cid;
+	if (ioctl(_RUN(fd), VIDIOC_G_CTRL, &ctrl) == 0) {
+		_E_LOG_INFO("Diag control applied: %s (%#x)=%d", cid_name, cid, ctrl.value);
+		return;
+	}
+
+	if (errno == EINVAL) {
+		_E_LOG_INFO("Diag control readback unavailable: %s (%#x)", cid_name, cid);
+		return;
+	}
+
+	_E_LOG_PERROR("Diag control readback failed for %s", cid_name);
+}
+
+static void _m2m_encoder_diag_report_format(
+	us_m2m_encoder_s *enc, const char *stream_name, const struct v4l2_format *fmt) {
+	if (!_g_m2m_diagnostics_enabled) {
+		return;
+	}
+
+	char fourcc_str[8];
+	_E_LOG_INFO(
+		"Diag %s format: %ux%u %s bytesperline=%u sizeimage=%u colorspace=%u",
+		stream_name,
+		fmt->fmt.pix_mp.width,
+		fmt->fmt.pix_mp.height,
+		us_fourcc_to_string(fmt->fmt.pix_mp.pixelformat, fourcc_str, sizeof(fourcc_str)),
+		fmt->fmt.pix_mp.plane_fmt[0].bytesperline,
+		fmt->fmt.pix_mp.plane_fmt[0].sizeimage,
+		fmt->fmt.pix_mp.colorspace
+	);
+}
+
+static void _m2m_encoder_diag_report_recommended_v4l2ctl(us_m2m_encoder_s *enc) {
+	if (!_g_m2m_diagnostics_enabled) {
+		return;
+	}
+	_E_LOG_INFO("Diag run on device: v4l2-ctl -d %s --list-ctrls-menus", enc->path);
+	_E_LOG_INFO("Diag run on device: v4l2-ctl -d %s --all", enc->path);
+}
+
+static void _m2m_encoder_diag_report_controls(us_m2m_encoder_s *enc) {
+	if (!_g_m2m_diagnostics_enabled) {
+		return;
+	}
+
+	if (enc->output_format == V4L2_PIX_FMT_H264) {
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_BITRATE, "V4L2_CID_MPEG_VIDEO_BITRATE");
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, "V4L2_CID_MPEG_VIDEO_H264_I_PERIOD");
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_H264_PROFILE, "V4L2_CID_MPEG_VIDEO_H264_PROFILE");
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_H264_LEVEL, "V4L2_CID_MPEG_VIDEO_H264_LEVEL");
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, "V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER");
+#if defined(V4L2_CID_MPEG_VIDEO_BITRATE_MODE)
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_BITRATE_MODE, "V4L2_CID_MPEG_VIDEO_BITRATE_MODE");
+#endif
+#if defined(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE)
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, "V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE");
+#endif
+#if defined(V4L2_CID_MPEG_VIDEO_H264_MIN_QP)
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, "V4L2_CID_MPEG_VIDEO_H264_MIN_QP");
+#endif
+#if defined(V4L2_CID_MPEG_VIDEO_H264_MAX_QP)
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, "V4L2_CID_MPEG_VIDEO_H264_MAX_QP");
+#endif
+	} else if (enc->output_format == V4L2_PIX_FMT_MJPEG) {
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_MPEG_VIDEO_BITRATE, "V4L2_CID_MPEG_VIDEO_BITRATE");
+	} else if (enc->output_format == V4L2_PIX_FMT_JPEG) {
+		_m2m_encoder_diag_report_ctrl_support(enc, V4L2_CID_JPEG_COMPRESSION_QUALITY, "V4L2_CID_JPEG_COMPRESSION_QUALITY");
+	}
 }
 
 static int _m2m_encoder_init_buffers(

@@ -31,6 +31,7 @@
 #include <iostream>
 #include <optional>
 #include <vector>
+#include <algorithm>
 
 #include "encode/m2m.h"
 #include "utils/thread_safe_queue.h"
@@ -51,6 +52,8 @@ us_encoder_set encoders;
 
 int isH264 = 0;
 int encoderQuality = 70;
+int encoderDiagnostics = 0;
+std::atomic<int> ws_client_count{0};
 
 MJPEGStreamer streamer;
 
@@ -63,10 +66,16 @@ int get_system_property_int(const char * prop_name) {
   }
 }
 
+static unsigned h264_bitrate_kbps_from_quality_percent(int quality_percent) {
+  const unsigned clamped_quality = static_cast<unsigned>(std::clamp(quality_percent, 1, 100));
+  return (32000u * clamped_quality) / 100u;
+}
+
 void createEncoders() {
   if (isH264) {
     std::string encoder_name_h264 = "encoder_h264";
-    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", 32000 * (encoderQuality / 100), 30);
+    const unsigned bitrate_kbps = h264_bitrate_kbps_from_quality_percent(encoderQuality);
+    encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", bitrate_kbps, 30);
   } else {
     std::string encoder_name_jpeg = "encoder_jpeg";
     encoders.jpeg_encoder = us_m2m_mjpeg_encoder_init(encoder_name_jpeg.c_str(), "/dev/video11", encoderQuality);
@@ -147,14 +156,15 @@ static bool push_one_screenshot_frame_dma()
   const int width  = gb->getWidth();
   const int height = gb->getHeight();
   const int bpp    = android::bytesPerPixel(gb->getPixelFormat()); // usually 4
-  const size_t bytes = (size_t)width * (size_t)height * (size_t)std::max(1, bpp);
+  const int stride_bytes = gb->getStride() * std::max(1, bpp);
+  const size_t bytes = (size_t)stride_bytes * (size_t)height;
 
   // Enqueue as DMA (data=NULL); keep your existing V4L2_FMT (BGR32) so encoder doesn't re-prepare
   us_frame_s encoderFrame = {};
   encoderFrame.width  = width;
   encoderFrame.height = height;
   encoderFrame.format = V4L2_PIX_FMT_BGR32; // matches your current pipeline
-  encoderFrame.stride = 0;                   // unused for DMA
+  encoderFrame.stride = stride_bytes;
   encoderFrame.used   = bytes;               // consumed as bytesused for DMABUF
   encoderFrame.force_key_on_encode = true;   // ensure IDR
   encoderFrame.data   = NULL;                // NULL for DMA path
@@ -218,7 +228,7 @@ void capture_thread() {
     encoderFrame.width = capturedFrame.width;
     encoderFrame.height = capturedFrame.height;
     encoderFrame.format = V4L2_PIX_FMT_BGR32;
-    encoderFrame.stride = capturedFrame.stride;
+    encoderFrame.stride = capturedFrame.stride * capturedFrame.bpp;
     encoderFrame.used = capturedFrame.size;
     encoderFrame.force_key_on_encode = false;
     encoderFrame.dma_fd = capturedFrame.dma_fd;
@@ -228,22 +238,16 @@ void capture_thread() {
   }
 }
 
-void encode_frame(us_m2m_encoder_s * encoder,
-  const us_frame_s & input_frame, us_frame_s & output_frame, unsigned format) {
-  output_frame = {};
-  output_frame.width = input_frame.width;
-  output_frame.height = input_frame.height;
-  output_frame.format = format;
-  output_frame.stride = 0;
-  output_frame.used = 0;
-  output_frame.data = NULL;
-  output_frame.force_key_on_encode = false;
-
+bool encode_frame(us_m2m_encoder_s * encoder,
+  const us_frame_s & input_frame, us_frame_s & output_frame) {
   int compression_result = us_m2m_encoder_compress(encoder, & input_frame, & output_frame, input_frame.force_key_on_encode);
 
   if (compression_result != 0) {
     fprintf(stderr, "Failed to compress frame (error code: %d)\n", compression_result);
+    return false;
   }
+
+  return (output_frame.data != nullptr && output_frame.used > 0);
 }
 
 static void release_input_frame_resources(const us_frame_s& frame) {
@@ -259,6 +263,9 @@ static void release_input_frame_resources(const us_frame_s& frame) {
 }
 
 void encode_thread() {
+  us_frame_s encoded_frame_h264 = {};
+  us_frame_s encoded_frame_jpeg = {};
+
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
     us_frame_s latest_frame = {};
@@ -269,24 +276,23 @@ void encode_thread() {
       latest_frame = {};
     }
 
-    if (isH264) {
-      us_frame_s encoded_frame_h264;
-      encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264, V4L2_PIX_FMT_H264);
+    if (ws_client_count.load(std::memory_order_relaxed) == 0) {
+      release_input_frame_resources(input_frame);
+      continue;
+    }
 
-      if (encoded_frame_h264.data != nullptr) {
+    if (isH264) {
+      if (encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264)) {
         ws_sendframe_bin(NULL, reinterpret_cast<char*>(encoded_frame_h264.data), encoded_frame_h264.used);
-        free(encoded_frame_h264.data);
       } else {
         std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
       }
+
     } else {
-      us_frame_s encoded_frame_jpeg;
-      encode_frame(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg, V4L2_PIX_FMT_JPEG);
-      if (encoded_frame_jpeg.data != nullptr) {
+      if (encode_frame(encoders.jpeg_encoder, input_frame, encoded_frame_jpeg)) {
         std::string frameData(reinterpret_cast<char*>(encoded_frame_jpeg.data), encoded_frame_jpeg.used);
         streamer.publish("/stream", frameData);
         ws_sendframe_bin(NULL, reinterpret_cast<char*>(encoded_frame_jpeg.data), encoded_frame_jpeg.used);
-        free(encoded_frame_jpeg.data);
       } else {
         std::cout << "encode_thread(): Encoded frame data is null" << std::endl;
       }
@@ -300,6 +306,7 @@ void ws_on_connection_opened(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection opened, addr: %s\n", cli);
+  ws_client_count.fetch_add(1, std::memory_order_relaxed);
 
   // Capture ONE screenshot as **DMABUF** so the encoder stays in DMA mode.
   if (!push_one_screenshot_frame_dma()) {
@@ -319,6 +326,10 @@ void ws_on_connection_closed(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection closed, addr: %s\n", cli);
+  int previous = ws_client_count.fetch_sub(1, std::memory_order_relaxed);
+  if (previous <= 0) {
+    ws_client_count.store(0, std::memory_order_relaxed);
+  }
 }
 
 void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
@@ -343,8 +354,29 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   ws_socket(&evs, 9091, 1, 1000);
   std::thread(ws_ping_thread).detach();
 
-  isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
-  encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
+  const int propIsH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
+  const int propQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
+  const int propEncoderDiagnostics = get_system_property_int("persist.tesla-android.virtual-display.encoder_diagnostics");
+
+  if (propIsH264 >= 0) {
+    isH264 = propIsH264;
+  }
+
+  if (propQuality > 0) {
+    encoderQuality = propQuality;
+  }
+
+  if (propEncoderDiagnostics > 0) {
+    encoderDiagnostics = 1;
+  }
+
+  us_m2m_encoder_set_diagnostics(encoderDiagnostics > 0);
+  if (encoderDiagnostics > 0) {
+    fprintf(stderr, "Encoder diagnostics enabled\n");
+    fprintf(stderr, "Run on device for extra diagnostics:\n");
+    fprintf(stderr, "  v4l2-ctl -d /dev/video11 --list-ctrls-menus\n");
+    fprintf(stderr, "  v4l2-ctl -d /dev/video11 --all\n");
+  }
 
   createEncoders();
 
