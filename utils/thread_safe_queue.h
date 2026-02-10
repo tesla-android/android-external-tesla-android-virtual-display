@@ -9,6 +9,7 @@ class ThreadSafeQueue {
 public:
     void push(const T& value);
     T pop();
+    bool try_pop(T& value);
 
 private:
     std::deque<T> queue_;

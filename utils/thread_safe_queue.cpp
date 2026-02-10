@@ -19,6 +19,16 @@ T ThreadSafeQueue<T>::pop() {
     return value;
 }
 
+template <typename T>
+bool ThreadSafeQueue<T>::try_pop(T& value) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (queue_.empty()) {
+        return false;
+    }
+    value = queue_.front();
+    queue_.pop_front();
+    return true;
+}
+
 // Explicit template instantiation each type used with ThreadSafeQueue
 template class ThreadSafeQueue<us_frame_s>;
-

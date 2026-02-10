@@ -150,7 +150,7 @@ static bool push_one_screenshot_frame_dma()
   const size_t bytes = (size_t)width * (size_t)height * (size_t)std::max(1, bpp);
 
   // Enqueue as DMA (data=NULL); keep your existing V4L2_FMT (BGR32) so encoder doesn't re-prepare
-  us_frame_s encoderFrame;
+  us_frame_s encoderFrame = {};
   encoderFrame.width  = width;
   encoderFrame.height = height;
   encoderFrame.format = V4L2_PIX_FMT_BGR32; // matches your current pipeline
@@ -201,20 +201,20 @@ void capture_thread() {
   int err;
   while (true) {
     if (!frameWaiter.waitForFrame()) {
-      fprintf(stderr, "Unable to wait for frame \n");
-      exit(1);
+      fprintf(stderr, "Unable to wait for frame, retrying\n");
+      continue;
     }
     if ((err = minicap -> consumePendingFrame( & capturedFrame)) != 0) {
       if (err == -EINTR) {
-        fprintf(stderr, "Frame consumption interrupted by EINTR \n");
-        exit(1);
+        fprintf(stderr, "Frame consumption interrupted by EINTR, retrying\n");
+        continue;
       } else {
         fprintf(stderr, "Unable to consume pending frame \n");
         exit(1);
       }
     }
 
-    us_frame_s encoderFrame;
+    us_frame_s encoderFrame = {};
     encoderFrame.width = capturedFrame.width;
     encoderFrame.height = capturedFrame.height;
     encoderFrame.format = V4L2_PIX_FMT_BGR32;
@@ -230,6 +230,7 @@ void capture_thread() {
 
 void encode_frame(us_m2m_encoder_s * encoder,
   const us_frame_s & input_frame, us_frame_s & output_frame, unsigned format) {
+  output_frame = {};
   output_frame.width = input_frame.width;
   output_frame.height = input_frame.height;
   output_frame.format = format;
@@ -243,17 +244,30 @@ void encode_frame(us_m2m_encoder_s * encoder,
   if (compression_result != 0) {
     fprintf(stderr, "Failed to compress frame (error code: %d)\n", compression_result);
   }
+}
 
-  // Close duplicated DMABUF fd if we created one for the screenshot frame
-  if (input_frame.dma_fd >= 0 && input_frame.data == NULL && input_frame.force_key_on_encode) {
-    // This heuristically matches our "screenshot-as-DMA" frame
-    close(input_frame.dma_fd);
+static void release_input_frame_resources(const us_frame_s& frame) {
+  // This heuristically matches our "screenshot-as-DMA" frame.
+  if (frame.dma_fd >= 0 && frame.data == NULL && frame.force_key_on_encode) {
+    close(frame.dma_fd);
+  }
+
+  // Free CPU buffers from normal (non-DMA) capture path (if any).
+  if (frame.data) {
+    free(frame.data);
   }
 }
 
 void encode_thread() {
   while (true) {
     us_frame_s input_frame = capture_queue.pop();
+    us_frame_s latest_frame = {};
+    while (capture_queue.try_pop(latest_frame)) {
+      // Drop stale frames to keep latency low under backpressure.
+      release_input_frame_resources(input_frame);
+      input_frame = latest_frame;
+      latest_frame = {};
+    }
 
     if (isH264) {
       us_frame_s encoded_frame_h264;
@@ -278,10 +292,7 @@ void encode_thread() {
       }
     }
 
-    // Free CPU buffers from normal (non-DMA) capture path (if any)
-    if (input_frame.data) {
-      free(input_frame.data);
-    }
+    release_input_frame_resources(input_frame);
   }
 }
 
@@ -315,6 +326,13 @@ void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
        __attribute__ ((unused)) uint64_t size,
        __attribute__ ((unused)) int type) {}
 
+void ws_ping_thread() {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    ws_ping(NULL, 5);
+  }
+}
+
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv) {
   minicap_start_thread_pool();
 
@@ -323,6 +341,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char ** argv)
   evs.onclose   = &ws_on_connection_closed;
   evs.onmessage = &ws_on_message;
   ws_socket(&evs, 9091, 1, 1000);
+  std::thread(ws_ping_thread).detach();
 
   isH264 = get_system_property_int("persist.tesla-android.virtual-display.is_h264");
   encoderQuality = get_system_property_int("persist.tesla-android.virtual-display.quality");
