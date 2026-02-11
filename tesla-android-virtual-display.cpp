@@ -67,13 +67,16 @@ int get_system_property_int(const char * prop_name) {
 
 static unsigned h264_bitrate_kbps_from_quality_percent(int quality_percent) {
   const unsigned clamped_quality = static_cast<unsigned>(std::clamp(quality_percent, 1, 100));
-  return (32000u * clamped_quality) / 100u;
+  const unsigned min_kbps = 2000u;
+  const unsigned max_kbps = 18000u;
+  return min_kbps + ((max_kbps - min_kbps) * (clamped_quality - 1u)) / 99u;
 }
 
 void createEncoders() {
   if (isH264) {
     std::string encoder_name_h264 = "encoder_h264";
     const unsigned bitrate_kbps = h264_bitrate_kbps_from_quality_percent(encoderQuality);
+    fprintf(stderr, "H264 target bitrate: %u kbps (quality=%d)\n", bitrate_kbps, encoderQuality);
     encoders.h264_encoder = us_m2m_h264_encoder_init(encoder_name_h264.c_str(), "/dev/video11", bitrate_kbps, 30);
   } else {
     std::string encoder_name_jpeg = "encoder_jpeg";
