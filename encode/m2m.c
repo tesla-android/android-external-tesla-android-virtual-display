@@ -237,64 +237,20 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 		}
 
 	if (enc->output_format == V4L2_PIX_FMT_H264) {
-		int high_profile_set = 0;
-		int level_set = 0;
-
 		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_BITRATE, enc->bitrate);
-#if defined(V4L2_CID_MPEG_VIDEO_BITRATE_MODE) && defined(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
-		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_BITRATE_MODE, V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
-#endif
 		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, enc->gop);
-#if defined(V4L2_CID_MPEG_VIDEO_H264_PROFILE) && defined(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)
-		{
-			int status = _m2m_encoder_set_ctrl(
-				enc,
-				V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-				V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
-				true,
-				"V4L2_CID_MPEG_VIDEO_H264_PROFILE(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH)"
-			);
-			if (status < 0) {
-				goto error;
-			}
-			high_profile_set = (status > 0);
-		}
-#endif
-		if (!high_profile_set) {
-			SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_PROFILE, V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE);
-		}
-#if defined(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE) && defined(V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC)
-		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC);
-#endif
+		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_PROFILE, V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE);
 		if (_RUN(width) * _RUN(height) <= 1920 * 1080) { // https://forums.raspberrypi.com/viewtopic.php?t=291447#p1762296
 			SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
-			level_set = 1;
 		} else {
-#if defined(V4L2_MPEG_VIDEO_H264_LEVEL_4_2)
-			{
-				int status = _m2m_encoder_set_ctrl(
-					enc,
-					V4L2_CID_MPEG_VIDEO_H264_LEVEL,
-					V4L2_MPEG_VIDEO_H264_LEVEL_4_2,
-					true,
-					"V4L2_CID_MPEG_VIDEO_H264_LEVEL(V4L2_MPEG_VIDEO_H264_LEVEL_4_2)"
-				);
-				if (status < 0) {
-					goto error;
-				}
-				level_set = (status > 0);
-			}
-#endif
-			if (!level_set) {
-				SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
-			}
+			SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_5_1);
 		}
 		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, 1);
 #if defined(V4L2_CID_MPEG_VIDEO_H264_MIN_QP)
-		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 12);
+		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 16);
 #endif
 #if defined(V4L2_CID_MPEG_VIDEO_H264_MAX_QP)
-		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 36);
+		SET_OPTION_OPTIONAL(V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 32);
 #endif
 	} else if (enc->output_format == V4L2_PIX_FMT_MJPEG) {
 		SET_OPTION_REQUIRED(V4L2_CID_MPEG_VIDEO_BITRATE, enc->bitrate);
@@ -312,15 +268,8 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 		fmt.fmt.pix_mp.height = _RUN(height);
 		fmt.fmt.pix_mp.pixelformat = _RUN(input_format);
 		fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
-#ifdef V4L2_COLORSPACE_SRGB
-		fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_SRGB;
-#else
-		fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG; // fallback for older headers
-#endif
+		fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG; // libcamera currently has no means to request the right colour space
 		fmt.fmt.pix_mp.num_planes = 1;
-		if (_RUN(stride) > 0) {
-			fmt.fmt.pix_mp.plane_fmt[0].bytesperline = _RUN(stride);
-		}
 		_E_LOG_DEBUG("Configuring INPUT format ...");
 		_E_XIOCTL(VIDIOC_S_FMT, &fmt, "Can't set INPUT format");
 		_m2m_encoder_diag_report_format(enc, "INPUT", &fmt);
@@ -339,15 +288,7 @@ static void _m2m_encoder_prepare(us_m2m_encoder_s *enc, const us_frame_s *frame)
 		if (enc->output_format == V4L2_PIX_FMT_H264) {
 			// https://github.com/pikvm/ustreamer/issues/169
 			// https://github.com/raspberrypi/linux/pull/5232
-			const uint64_t min_sizeimage = (uint64_t)((1024 + 512) << 10); // 1.5 MiB
-			uint64_t dynamic_sizeimage = ((uint64_t)_RUN(width) * _RUN(height) * 3) / 2;
-			if (dynamic_sizeimage < min_sizeimage) {
-				dynamic_sizeimage = min_sizeimage;
-			}
-			if (dynamic_sizeimage > UINT32_MAX) {
-				dynamic_sizeimage = UINT32_MAX;
-			}
-			fmt.fmt.pix_mp.plane_fmt[0].sizeimage = (uint32_t)dynamic_sizeimage;
+			fmt.fmt.pix_mp.plane_fmt[0].sizeimage = (1024 + 512) << 10; // 1.5Mb
 		}
 		_E_LOG_DEBUG("Configuring OUTPUT format ...");
 		_E_XIOCTL(VIDIOC_S_FMT, &fmt, "Can't set OUTPUT format");

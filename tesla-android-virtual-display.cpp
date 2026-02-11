@@ -53,7 +53,6 @@ us_encoder_set encoders;
 int isH264 = 0;
 int encoderQuality = 70;
 int encoderDiagnostics = 0;
-std::atomic<int> ws_client_count{0};
 
 MJPEGStreamer streamer;
 
@@ -276,11 +275,6 @@ void encode_thread() {
       latest_frame = {};
     }
 
-    if (ws_client_count.load(std::memory_order_relaxed) == 0) {
-      release_input_frame_resources(input_frame);
-      continue;
-    }
-
     if (isH264) {
       if (encode_frame(encoders.h264_encoder, input_frame, encoded_frame_h264)) {
         ws_sendframe_bin(NULL, reinterpret_cast<char*>(encoded_frame_h264.data), encoded_frame_h264.used);
@@ -306,7 +300,6 @@ void ws_on_connection_opened(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection opened, addr: %s\n", cli);
-  ws_client_count.fetch_add(1, std::memory_order_relaxed);
 
   // Capture ONE screenshot as **DMABUF** so the encoder stays in DMA mode.
   if (!push_one_screenshot_frame_dma()) {
@@ -326,10 +319,6 @@ void ws_on_connection_closed(ws_cli_conn_t *client) {
   char *cli;
   cli = ws_getaddress(client);
   printf("Connection closed, addr: %s\n", cli);
-  int previous = ws_client_count.fetch_sub(1, std::memory_order_relaxed);
-  if (previous <= 0) {
-    ws_client_count.store(0, std::memory_order_relaxed);
-  }
 }
 
 void ws_on_message(__attribute__ ((unused)) ws_cli_conn_t *client,
