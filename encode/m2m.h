@@ -79,6 +79,7 @@ void us_m2m_encoder_destroy(us_m2m_encoder_s *enc);
 int us_m2m_encoder_compress(us_m2m_encoder_s *enc, const us_frame_s *src, us_frame_s *dest, bool force_key);
 
 int us_m2m_encoder_request_keyframe(us_m2m_encoder_s *enc);
+void us_m2m_encoder_set_diagnostics(bool enabled);
 
 #ifdef __cplusplus
 }
